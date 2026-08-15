@@ -1,16 +1,13 @@
 import os
 import logging
-import json
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -21,11 +18,9 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
-from telegram.constants import ParseMode
 
-# SQLAlchemy + asyncpg
+# SQLAlchemy
 from sqlalchemy import (
-    create_engine,
     Column,
     Integer,
     String,
@@ -36,20 +31,19 @@ from sqlalchemy import (
     select,
     delete,
     update,
-    func,
     UniqueConstraint,
 )
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 # Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/db")
+
+# Если URL начинается с postgresql:// (без +asyncpg), заменяем на асинхронный драйвер
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 # Настройка логирования
 logging.basicConfig(
@@ -64,9 +58,7 @@ UTC_TZ = timezone.utc
 
 def msk_to_utc(msk_naive: datetime) -> datetime:
     """Преобразует наивное время, введённое как московское, в наивное UTC."""
-    # Сделаем время осознанным как московское
     msk_aware = msk_naive.replace(tzinfo=MSK_TZ)
-    # Конвертируем в UTC и убираем временную зону
     utc_aware = msk_aware.astimezone(UTC_TZ)
     return utc_aware.replace(tzinfo=None)
 
@@ -97,7 +89,7 @@ class Match(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     team1 = Column(String(100), nullable=False)
     team2 = Column(String(100), nullable=False)
-    match_time = Column(DateTime, nullable=False)  # хранится в UTC (наивное)
+    match_time = Column(DateTime, nullable=False)  # хранится в UTC
     created_at = Column(DateTime, default=datetime.utcnow)
     notification_45_sent = Column(Boolean, default=False)
     notification_15_sent = Column(Boolean, default=False)
@@ -172,7 +164,6 @@ async def get_matches() -> List[Match]:
         return result.scalars().all()
 
 async def add_match(team1: str, team2: str, match_time: datetime) -> Match:
-    # match_time должно быть в UTC (наивное)
     async with AsyncSessionLocal() as session:
         match = Match(team1=team1, team2=team2, match_time=match_time)
         session.add(match)
@@ -221,7 +212,7 @@ async def mark_reposted(channel_id: int, message_id: int) -> None:
         await session.commit()
 
 # --- Обработчики команд ---
-# Состояния для ConversationHandler (админка)
+# Состояния для ConversationHandler
 (LOGIN, PASSWORD, ADMIN_MENU,
  ADD_CHAT_ID, ADD_CHAT_NAME,
  DELETE_CHAT_SELECT,
@@ -229,16 +220,13 @@ async def mark_reposted(channel_id: int, message_id: int) -> None:
  ADD_MATCH_TEAM1, ADD_MATCH_TEAM2, ADD_MATCH_TIME,
  ADD_CHANNEL_ID, DELETE_CHANNEL_SELECT) = range(14)
 
-# Глобальная переменная для хранения временных данных пользователя (если нужна)
-user_data_store = {}
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "В данном боте нет ничего интересного, он предназначен для раскаток и всему подобному.\n"
         "Лучше перейди и играй в нашем боте в карточки игроков Puck - @rplpuck_bot."
     )
 
-# --- Админка (ConversationHandler) ---
+# --- Админка ---
 async def adminkarpl_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Введите логин:")
     return LOGIN
@@ -273,7 +261,7 @@ def admin_menu_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -282,8 +270,6 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif data == "menu_server":
         await show_server_settings(query)
     elif data == "menu_add_match":
-        await query.edit_message_text("Введите название первой команды (или выберите из списка):")
-        # Покажем кнопки с существующими чатами для выбора
         chats = await get_chats()
         if chats:
             buttons = [[InlineKeyboardButton(chat.name, callback_data=f"team1_{chat.name}")] for chat in chats]
@@ -315,16 +301,15 @@ async def show_server_settings(query):
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def chats_menu_keyboard():
-    keyboard = [
+def chats_menu_keyboard():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("Добавить чат", callback_data="add_chat")],
         [InlineKeyboardButton("Удалить чат", callback_data="delete_chat")],
         [InlineKeyboardButton("Список чатов", callback_data="list_chats")],
         [InlineKeyboardButton("Назад", callback_data="back_menu")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
-async def chats_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def chats_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -336,18 +321,13 @@ async def chats_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not chats:
             await query.edit_message_text("Нет чатов для удаления.")
             return ADMIN_MENU
-        buttons = []
-        for chat in chats:
-            buttons.append([InlineKeyboardButton(f"{chat.name} ({chat.chat_id})", callback_data=f"del_{chat.chat_id}")])
+        buttons = [[InlineKeyboardButton(f"{c.name} ({c.chat_id})", callback_data=f"del_{c.chat_id}")] for c in chats]
         buttons.append([InlineKeyboardButton("Назад", callback_data="back_menu")])
         await query.edit_message_text("Выберите чат для удаления:", reply_markup=InlineKeyboardMarkup(buttons))
         return DELETE_CHAT_SELECT
     elif data == "list_chats":
         chats = await get_chats()
-        if not chats:
-            text = "Нет добавленных чатов."
-        else:
-            text = "Список чатов:\n" + "\n".join([f"{c.name} (ID: {c.chat_id})" for c in chats])
+        text = "Нет добавленных чатов." if not chats else "Список чатов:\n" + "\n".join([f"{c.name} (ID: {c.chat_id})" for c in chats])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back_menu")]]))
         return ADMIN_MENU
     elif data == "back_menu":
@@ -367,14 +347,12 @@ async def add_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def add_chat_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text
     chat_id = context.user_data['temp_chat_id']
-    # Проверяем, не существует ли уже
     existing = await get_chat_by_id(chat_id)
     if existing:
         await update.message.reply_text(f"Чат с ID {chat_id} уже существует (название: {existing.name}).")
     else:
         await add_chat(chat_id, name)
         await update.message.reply_text(f"Чат '{name}' (ID: {chat_id}) добавлен.")
-    # Возвращаемся в меню управления чатами
     await update.message.reply_text("Меню управления чатами:", reply_markup=chats_menu_keyboard())
     return ADMIN_MENU
 
@@ -392,14 +370,11 @@ async def delete_chat_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text(f"Чат с ID {chat_id} удален.")
         else:
             await query.edit_message_text("Не удалось удалить чат.")
-        # показать обновленный список
         chats = await get_chats()
         if not chats:
             await query.edit_message_text("Нет чатов.", reply_markup=chats_menu_keyboard())
         else:
-            buttons = []
-            for chat in chats:
-                buttons.append([InlineKeyboardButton(f"{chat.name} ({chat.chat_id})", callback_data=f"del_{chat.chat_id}")])
+            buttons = [[InlineKeyboardButton(f"{c.name} ({c.chat_id})", callback_data=f"del_{c.chat_id}")] for c in chats]
             buttons.append([InlineKeyboardButton("Назад", callback_data="back_menu")])
             await query.edit_message_text("Выберите чат для удаления:", reply_markup=InlineKeyboardMarkup(buttons))
         return DELETE_CHAT_SELECT
@@ -407,8 +382,7 @@ async def delete_chat_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("Неизвестная команда.")
         return DELETE_CHAT_SELECT
 
-# Обработчики для настроек сервера
-async def server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -432,7 +406,6 @@ async def set_server_value(update: Update, context: ContextTypes.DEFAULT_TYPE, k
     value = update.message.text
     await set_server_setting(key, value)
     await update.message.reply_text(f"Настройка {key} обновлена.")
-    # показать настройки
     await show_server_settings_simple(update)
     return ADMIN_MENU
 
@@ -449,7 +422,6 @@ async def show_server_settings_simple(update):
     ]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Добавление матча ---
 async def add_match_team1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -457,25 +429,20 @@ async def add_match_team1(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("team1_"):
         team = data.split("_", 1)[1]
         context.user_data['match_team1'] = team
-        # просим выбрать вторую команду
         chats = await get_chats()
-        buttons = [[InlineKeyboardButton(chat.name, callback_data=f"team2_{chat.name}")] for chat in chats if chat.name != team]
+        buttons = [[InlineKeyboardButton(c.name, callback_data=f"team2_{c.name}")] for c in chats if c.name != team]
         buttons.append([InlineKeyboardButton("Ввести вручную", callback_data="team2_manual")])
         await query.edit_message_text("Выберите вторую команду:", reply_markup=InlineKeyboardMarkup(buttons))
         return ADD_MATCH_TEAM2
     elif data == "team1_manual":
         await query.edit_message_text("Введите название первой команды вручную:")
-        return ADD_MATCH_TEAM1  # остаемся в том же состоянии, но будем ждать текст
-    else:
-        await query.edit_message_text("Неизвестный выбор.")
         return ADD_MATCH_TEAM1
 
 async def add_match_team1_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     team = update.message.text
     context.user_data['match_team1'] = team
-    # просим вторую команду
     chats = await get_chats()
-    buttons = [[InlineKeyboardButton(chat.name, callback_data=f"team2_{chat.name}")] for chat in chats if chat.name != team]
+    buttons = [[InlineKeyboardButton(c.name, callback_data=f"team2_{c.name}")] for c in chats if c.name != team]
     buttons.append([InlineKeyboardButton("Ввести вручную", callback_data="team2_manual")])
     await update.message.reply_text("Выберите вторую команду:", reply_markup=InlineKeyboardMarkup(buttons))
     return ADD_MATCH_TEAM2
@@ -487,66 +454,53 @@ async def add_match_team2(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("team2_"):
         team = data.split("_", 1)[1]
         context.user_data['match_team2'] = team
-        await query.edit_message_text("Введите дату и время матча в формате ГГГГ-ММ-ДД ЧЧ:ММ (например, 2026-08-16 20:00) по МСК:")
+        await query.edit_message_text("Введите дату и время матча в формате ГГГГ-ММ-ДД ЧЧ:ММ (по МСК):")
         return ADD_MATCH_TIME
     elif data == "team2_manual":
         await query.edit_message_text("Введите название второй команды вручную:")
-        return ADD_MATCH_TEAM2
-    else:
-        await query.edit_message_text("Неизвестный выбор.")
         return ADD_MATCH_TEAM2
 
 async def add_match_team2_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     team = update.message.text
     context.user_data['match_team2'] = team
-    await update.message.reply_text("Введите дату и время матча в формате ГГГГ-ММ-ДД ЧЧ:ММ (например, 2026-08-16 20:00) по МСК:")
+    await update.message.reply_text("Введите дату и время матча в формате ГГГГ-ММ-ДД ЧЧ:ММ (по МСК):")
     return ADD_MATCH_TIME
 
 async def add_match_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     time_str = update.message.text
     try:
-        # Парсим как наивное время (пользователь вводит по МСК)
         msk_naive = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
     except ValueError:
         await update.message.reply_text("Неверный формат. Используйте ГГГГ-ММ-ДД ЧЧ:ММ (по МСК)")
         return ADD_MATCH_TIME
-    # Преобразуем в UTC
     utc_naive = msk_to_utc(msk_naive)
     team1 = context.user_data['match_team1']
     team2 = context.user_data['match_team2']
-    # Сохраняем матч (время в UTC)
     match = await add_match(team1, team2, utc_naive)
-    # Показываем пользователю время в МСК
     msk_display = utc_to_msk(utc_naive)
     await update.message.reply_text(
         f"Матч {team1} - {team2} на {msk_display.strftime('%Y-%m-%d %H:%M')} (МСК) добавлен."
     )
-    # Планируем уведомления
     await schedule_match_notifications(context.bot, match)
-    # Возврат в меню
     await update.message.reply_text("Главное меню:", reply_markup=admin_menu_keyboard())
     return ADMIN_MENU
 
 # --- Планирование уведомлений ---
 async def schedule_match_notifications(bot, match: Match):
-    from telegram.ext import JobQueue
-    # match.match_time уже в UTC (наивное)
     time_45 = match.match_time - timedelta(minutes=45)
     time_15 = match.match_time - timedelta(minutes=15)
     now = datetime.utcnow()
     if now < time_45 and not match.notification_45_sent:
-        job_queue = bot.job_queue
-        if job_queue:
-            job_queue.run_at(
+        if bot.job_queue:
+            bot.job_queue.run_at(
                 send_45_min_notification,
                 time_45,
                 name=f"match_{match.id}_45",
                 user_id=match.id,
             )
     if now < time_15 and not match.notification_15_sent:
-        job_queue = bot.job_queue
-        if job_queue:
-            job_queue.run_at(
+        if bot.job_queue:
+            bot.job_queue.run_at(
                 send_15_min_notification,
                 time_15,
                 name=f"match_{match.id}_15",
@@ -560,7 +514,6 @@ async def send_45_min_notification(context: ContextTypes.DEFAULT_TYPE):
         match = result.scalar_one_or_none()
         if not match or match.notification_45_sent:
             return
-        # Отправляем во все чаты
         chats = await get_chats()
         for chat in chats:
             try:
@@ -570,7 +523,6 @@ async def send_45_min_notification(context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logger.error(f"Не удалось отправить в чат {chat.chat_id}: {e}")
-        # Отмечаем отправленным
         await update_match_notification_sent(match_id, "notification_45_sent")
 
 async def send_15_min_notification(context: ContextTypes.DEFAULT_TYPE):
@@ -580,7 +532,6 @@ async def send_15_min_notification(context: ContextTypes.DEFAULT_TYPE):
         match = result.scalar_one_or_none()
         if not match or match.notification_15_sent:
             return
-        # Получаем настройки сервера
         ip = await get_server_setting("server_ip") or "не задан"
         port = await get_server_setting("server_port") or "не задан"
         password = await get_server_setting("server_password") or "не задан"
