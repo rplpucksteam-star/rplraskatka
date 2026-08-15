@@ -57,7 +57,7 @@ ADMIN_SESSION_HOURS = 12
     MATCH_TIME,
     # Канал
     SET_SOURCE_CHANNEL,
-) = range(11)
+) = range(12)   # <--- ИСПРАВЛЕНО: было 11, стало 12
 
 # ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
 def get_db():
