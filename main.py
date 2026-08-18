@@ -56,6 +56,7 @@ async def init_pool():
     global _pool
     _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5, command_timeout=15)
     async with _pool.acquire() as conn:
+        # Создаём таблицы, если их нет
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS chats (
@@ -103,6 +104,29 @@ async def init_pool():
             );
             """
         )
+
+        # Добавляем недостающие колонки (если таблица уже существовала без них)
+        alter_commands = [
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_home_chat_id BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_home_name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_away_chat_id BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_away_name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_time TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS server_name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS server_ip TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS server_port TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS server_password TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS notified_45 BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS notified_15 BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        ]
+        for cmd in alter_commands:
+            try:
+                await conn.execute(cmd)
+            except asyncpg.exceptions.DuplicateColumnError:
+                pass  # колонка уже существует
+            except Exception as e:
+                logging.warning(f"Не удалось выполнить ALTER: {e}")
 
 
 async def add_chat(chat_id: int, name: str):
@@ -584,7 +608,6 @@ async def process_server_port(message: Message, state: FSMContext):
     await message.answer("4️⃣ Пришлите <b>Password</b> сервера:")
 
 
-# ===== ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ =====
 @panel_router.message(AddServer.waiting_password)
 async def process_server_password(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -763,10 +786,8 @@ async def process_match_datetime(message: Message, state: FSMContext):
     await message.answer("4️⃣ Выберите <b>сервер</b> для этого матча:", reply_markup=servers_choice_kb(servers))
 
 
-# ===== ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ =====
 @panel_router.callback_query(AddMatch.waiting_server, F.data.startswith("srv:"))
 async def cb_pick_server(call: CallbackQuery, state: FSMContext):
-    # Диагностика: сразу отвечаем на колбэк и пишем, что вошли
     await call.answer("⏳ Обработка...")
     await call.message.answer("🔍 Шаг 1: обработчик запущен.")
 
