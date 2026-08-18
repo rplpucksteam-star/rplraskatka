@@ -104,7 +104,7 @@ async def init_pool():
             """
         )
 
-        # Добавляем недостающие колонки на случай, если таблица была создана старой версией
+        # Добавляем недостающие колонки и исправляем тип match_time
         alter_commands = [
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_home_chat_id BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_home_name TEXT NOT NULL DEFAULT ''",
@@ -118,6 +118,8 @@ async def init_pool():
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS notified_45 BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS notified_15 BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            # Конвертируем тип колонки match_time в TIMESTAMPTZ на случай, если она создалась как TIMESTAMP
+            "ALTER TABLE matches ALTER COLUMN match_time TYPE TIMESTAMPTZ USING match_time AT TIME ZONE 'UTC'",
         ]
         for cmd in alter_commands:
             try:
@@ -225,10 +227,10 @@ async def delete_server(server_id: int):
 
 async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
                      match_time, server_name, server_ip, server_port, server_password):
-    # Приводим время к UTC и делаем naive (без tzinfo)
-    if match_time.tzinfo is not None:
-        match_time = match_time.astimezone(timezone.utc)
-    match_time_naive = match_time.replace(tzinfo=None)  # теперь это наивный UTC
+    # Гарантируем, что дата является timezone-aware (UTC)
+    if match_time.tzinfo is None:
+        match_time = match_time.replace(tzinfo=MSK)
+    match_time = match_time.astimezone(timezone.utc)
 
     async with _pool.acquire() as conn:
         return await conn.fetchrow(
@@ -237,11 +239,11 @@ async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_a
                 team_home_chat_id, team_home_name,
                 team_away_chat_id, team_away_name,
                 match_time, server_name, server_ip, server_port, server_password
-            ) VALUES ($1,$2,$3,$4, $5::timestamp AT TIME ZONE 'UTC', $6,$7,$8,$9)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
             RETURNING *
             """,
             team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
-            match_time_naive, server_name, server_ip, server_port, server_password,
+            match_time, server_name, server_ip, server_port, server_password,
         )
 
 
