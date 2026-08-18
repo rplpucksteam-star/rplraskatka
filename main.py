@@ -225,12 +225,10 @@ async def delete_server(server_id: int):
 
 async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
                      match_time, server_name, server_ip, server_port, server_password):
-    # Приводим время к UTC с явным часовым поясом UTC
+    # Приводим время к UTC и делаем naive (без tzinfo)
     if match_time.tzinfo is not None:
         match_time = match_time.astimezone(timezone.utc)
-    else:
-        # Если наивное, считаем, что это UTC
-        match_time = match_time.replace(tzinfo=timezone.utc)
+    match_time_naive = match_time.replace(tzinfo=None)  # теперь это наивный UTC
 
     async with _pool.acquire() as conn:
         return await conn.fetchrow(
@@ -239,11 +237,11 @@ async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_a
                 team_home_chat_id, team_home_name,
                 team_away_chat_id, team_away_name,
                 match_time, server_name, server_ip, server_port, server_password
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ) VALUES ($1,$2,$3,$4, $5::timestamp AT TIME ZONE 'UTC', $6,$7,$8,$9)
             RETURNING *
             """,
             team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
-            match_time, server_name, server_ip, server_port, server_password,
+            match_time_naive, server_name, server_ip, server_port, server_password,
         )
 
 
