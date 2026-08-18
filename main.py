@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -57,7 +57,6 @@ _pool: asyncpg.Pool | None = None
 
 async def init_pool():
     global _pool
-    # command_timeout — чтобы зависший запрос обрывался сам, а не морозил бота навсегда
     _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5, command_timeout=15)
     async with _pool.acquire() as conn:
         await conn.execute(
@@ -214,6 +213,10 @@ async def delete_server(server_id: int):
 
 async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
                      match_time, server_name, server_ip, server_port, server_password):
+    # Приводим время к UTC для корректного сохранения в БД
+    if match_time.tzinfo is not None:
+        match_time = match_time.astimezone(timezone.utc)
+
     async with _pool.acquire() as conn:
         return await conn.fetchrow(
             """
@@ -1065,7 +1068,6 @@ async def main():
     dp.include_router(channel_router)
 
     # Глобальный обработчик ошибок — чтобы бот больше НИКОГДА не "зависал" молча.
-    # Любое неотловленное исключение логируется и юзер получает понятный ответ.
     @dp.errors()
     async def global_error_handler(event: ErrorEvent):
         logging.exception("Необработанная ошибка при обработке апдейта", exc_info=event.exception)
