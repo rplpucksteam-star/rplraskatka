@@ -1,616 +1,841 @@
-import os
-import logging
 import asyncio
-from datetime import datetime, timedelta
-import pytz
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import logging
+import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
-)
+import asyncpg
+from dotenv import load_dotenv
 
-# Настройка логирования
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Часовой пояс (Москва, UTC+3)
-MSK_TZ = pytz.timezone("Europe/Moscow")
+# =========================================================
+#                       КОНФИГ
+# =========================================================
 
-# Токен и URL базы данных
-TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+load_dotenv()
 
-ADMIN_LOGIN = "adminrpl"
-ADMIN_PASSWORD = "rpl1488"
-ADMIN_SESSION_HOURS = 12
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Состояния разговорных хэндлеров
-(
-    WAITING_LOGIN,
-    WAITING_PASSWORD,
-    # Команды и сервер
-    ADD_TEAM_CHAT_ID,
-    ADD_TEAM_NAME,
-    SET_SERVER_NAME,
-    SET_SERVER_IP,
-    SET_SERVER_PORT,
-    SET_SERVER_PASS,
-    # Матчи
-    MATCH_HOME_TEAM,
-    MATCH_AWAY_TEAM,
-    MATCH_TIME,
-    # Канал
-    SET_SOURCE_CHANNEL,
-) = range(12)   # <--- ИСПРАВЛЕНО: было 11, стало 12
+ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "adminrpl")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "rpl1488")
 
-# ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
-def get_db():
-    url = DATABASE_URL
-    if url and url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return psycopg2.connect(url, cursor_factory=RealDictCursor)
+REMIND_BEFORE_1 = 45  # минут до матча — "не забудьте прийти"
+REMIND_BEFORE_2 = 15  # минут до матча — раскатка
 
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
+ALLOWED_HASHTAGS = {"#rplpuck", "#matchday", "#result"}
+PUCK_BOT_USERNAME = "@rplpuck_bot"
 
-    # Админы
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY,
-            login_time TIMESTAMP
+SCHEDULER_INTERVAL = 20  # сек, как часто проверять базу на напоминания
+
+MSK = ZoneInfo("Europe/Moscow")  # 🕒 часовой пояс, в котором админ вводит время матча
+
+# =========================================================
+#                        БАЗА ДАННЫХ
+# =========================================================
+
+_pool: asyncpg.Pool | None = None
+
+
+async def init_pool():
+    global _pool
+    _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT UNIQUE NOT NULL,
+                name TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS channels (
+                id SERIAL PRIMARY KEY,
+                channel_id BIGINT UNIQUE NOT NULL,
+                title TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_chats (
+                id SERIAL PRIMARY KEY,
+                channel_id BIGINT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
+                chat_id BIGINT NOT NULL,
+                UNIQUE(channel_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS matches (
+                id SERIAL PRIMARY KEY,
+                team_home_chat_id BIGINT NOT NULL,
+                team_home_name TEXT NOT NULL,
+                team_away_chat_id BIGINT NOT NULL,
+                team_away_name TEXT NOT NULL,
+                match_time TIMESTAMPTZ NOT NULL,
+                server_name TEXT NOT NULL DEFAULT '',
+                server_ip TEXT NOT NULL DEFAULT '',
+                server_port TEXT NOT NULL DEFAULT '',
+                server_password TEXT NOT NULL DEFAULT '',
+                notified_45 BOOLEAN NOT NULL DEFAULT FALSE,
+                notified_15 BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
         )
-    """)
 
-    # Команды / Чаты
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS teams (
-            id SERIAL PRIMARY KEY,
-            chat_id BIGINT UNIQUE NOT NULL,
-            team_name TEXT NOT NULL
+
+# ---------- CHATS ----------
+
+async def add_chat(chat_id: int, name: str):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO chats (chat_id, name) VALUES ($1, $2)
+            ON CONFLICT (chat_id) DO UPDATE SET name = EXCLUDED.name
+            """,
+            chat_id, name,
         )
-    """)
 
-    # Настройки сервера и канала
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS bot_config (
-            key TEXT PRIMARY KEY,
-            value TEXT
+
+async def get_chats():
+    async with _pool.acquire() as conn:
+        return await conn.fetch("SELECT * FROM chats ORDER BY name")
+
+
+async def get_chat(chat_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM chats WHERE chat_id = $1", chat_id)
+
+
+# ---------- CHANNELS ----------
+
+async def add_channel(channel_id: int, title: str):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO channels (channel_id, title) VALUES ($1, $2)
+            ON CONFLICT (channel_id) DO UPDATE SET title = EXCLUDED.title
+            """,
+            channel_id, title,
         )
-    """)
 
-    # Матчи
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS matches (
-            id SERIAL PRIMARY KEY,
-            home_team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE,
-            away_team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE,
-            match_time TIMESTAMP NOT NULL,
-            warn_45_sent BOOLEAN DEFAULT FALSE,
-            warn_15_sent BOOLEAN DEFAULT FALSE
+
+async def get_channels():
+    async with _pool.acquire() as conn:
+        return await conn.fetch("SELECT * FROM channels ORDER BY title")
+
+
+async def get_channel(channel_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM channels WHERE channel_id = $1", channel_id)
+
+
+async def link_channel_chat(channel_id: int, chat_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO channel_chats (channel_id, chat_id) VALUES ($1, $2)
+            ON CONFLICT (channel_id, chat_id) DO NOTHING
+            """,
+            channel_id, chat_id,
         )
-    """)
 
-    conn.commit()
-    conn.close()
 
-def get_config(key, default=""):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT value FROM bot_config WHERE key = %s", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row["value"] if row else default
+async def get_linked_chats(channel_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT c.* FROM chats c
+            JOIN channel_chats cc ON cc.chat_id = c.chat_id
+            WHERE cc.channel_id = $1
+            ORDER BY c.name
+            """,
+            channel_id,
+        )
 
-def set_config(key, value):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO bot_config (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        (key, str(value)),
+
+async def get_linked_chat_ids(channel_id: int):
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT chat_id FROM channel_chats WHERE channel_id = $1", channel_id)
+        return {r["chat_id"] for r in rows}
+
+
+# ---------- MATCHES ----------
+
+async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
+                     match_time, server_name, server_ip, server_port, server_password):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            INSERT INTO matches (
+                team_home_chat_id, team_home_name,
+                team_away_chat_id, team_away_name,
+                match_time, server_name, server_ip, server_port, server_password
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            RETURNING *
+            """,
+            team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
+            match_time, server_name, server_ip, server_port, server_password,
+        )
+
+
+async def get_upcoming_matches():
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT * FROM matches WHERE match_time > NOW() - INTERVAL '2 hours' ORDER BY match_time"
+        )
+
+
+async def get_match(match_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM matches WHERE id = $1", match_id)
+
+
+async def delete_match(match_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM matches WHERE id = $1", match_id)
+
+
+async def get_matches_due_for(minutes_before: int, column: str):
+    query = f"""
+        SELECT * FROM matches
+        WHERE {column} = FALSE
+          AND match_time - (INTERVAL '1 minute' * $1) <= NOW()
+          AND match_time > NOW() - INTERVAL '30 minutes'
+    """
+    async with _pool.acquire() as conn:
+        return await conn.fetch(query, minutes_before)
+
+
+async def mark_notified(match_id: int, column: str):
+    query = f"UPDATE matches SET {column} = TRUE WHERE id = $1"
+    async with _pool.acquire() as conn:
+        await conn.execute(query, match_id)
+
+
+# =========================================================
+#                    ТЕКСТЫ СООБЩЕНИЙ
+# =========================================================
+
+def reminder_45_text(team_home: str, team_away: str) -> str:
+    return (
+        "⏰ <b>Внимание, до матча осталось 45 минут!</b>\n"
+        "Не забудьте прийти! 🙌\n\n"
+        f"🆚 {team_home} — {team_away}"
     )
-    conn.commit()
-    conn.close()
 
-def is_admin(user_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT login_time FROM admins WHERE user_id = %s", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return True
-    return False
 
-def add_admin(user_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO admins (user_id, login_time) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET login_time = EXCLUDED.login_time",
-        (user_id, datetime.now(MSK_TZ)),
-    )
-    conn.commit()
-    conn.close()
-
-def remove_admin(user_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
-    conn.commit()
-    conn.close()
-
-# ---------- КЛАВИАТУРЫ ----------
-def admin_menu_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            ["⚽ Добавить матч", "📋 Список матчей"],
-            ["🏒 Добавить команду/чат", "🛡 Список команд"],
-            ["⚙️ Настройки сервера", "📢 Настроить канал"],
-            ["🚪 Выйти из админки"],
-        ],
-        resize_keyboard=True,
+def raskatka_text(server_name, server_ip, server_port, server_password, team_home, team_away, color) -> str:
+    return (
+        "🎮 <b>Калл! Раскатка!</b>\n\n"
+        f"🖥 <b>{server_name}</b>\n"
+        f"🌐 IP сервера: <code>{server_ip}</code>\n"
+        f"🔌 Port сервера: <code>{server_port}</code>\n"
+        f"🔑 Password сервера: <code>{server_password}</code>\n\n"
+        f"👉 Вы {color}.\n\n"
+        "ℹ️ Если что:\n"
+        f"🔴 Хозяева — ред ({team_home})\n"
+        f"🔵 Гости — блу ({team_away})"
     )
 
-# ---------- СТАРТ И АВТОРИЗАЦИЯ ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# =========================================================
+#                  FSM-СОСТОЯНИЯ АДМИНКИ
+# =========================================================
+
+class AdminAuth(StatesGroup):
+    waiting_login = State()
+    waiting_password = State()
+
+
+class AddChat(StatesGroup):
+    waiting_id = State()
+    waiting_name = State()
+
+
+class AddMatch(StatesGroup):
+    waiting_team1 = State()
+    waiting_team2 = State()
+    waiting_datetime = State()
+    waiting_server_name = State()
+    waiting_ip = State()
+    waiting_port = State()
+    waiting_password = State()
+
+
+class AddChannel(StatesGroup):
+    waiting_id = State()
+    waiting_title = State()
+    waiting_chats = State()
+
+
+# =========================================================
+#                       КЛАВИАТУРЫ
+# =========================================================
+
+def admin_main_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить чат", callback_data="adm:add_chat")
+    kb.button(text="📋 Список чатов", callback_data="adm:list_chats")
+    kb.button(text="🆚 Добавить матч", callback_data="adm:add_match")
+    kb.button(text="📅 Список матчей", callback_data="adm:list_matches")
+    kb.button(text="📡 Привязать канал", callback_data="adm:add_channel")
+    kb.button(text="🔗 Список каналов", callback_data="adm:list_channels")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def back_to_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    return kb.as_markup()
+
+
+def chats_choice_kb(chats, prefix: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for c in chats:
+        kb.button(text=f"🏒 {c['name']}", callback_data=f"{prefix}:{c['chat_id']}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def chats_multiselect_kb(chats, selected: set) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for c in chats:
+        mark = "✅" if c["chat_id"] in selected else "⬜️"
+        kb.button(text=f"{mark} {c['name']}", callback_data=f"cf_toggle:{c['chat_id']}")
+    kb.button(text="✔️ Готово", callback_data="cf_done")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def matches_list_kb(matches) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for m in matches:
+        local_time = m["match_time"].astimezone(MSK)
+        label = f"{m['team_home_name']} 🆚 {m['team_away_name']} — {local_time.strftime('%d.%m %H:%M')} МСК"
+        kb.button(text=label, callback_data=f"adm:match:{m['id']}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def match_card_kb(match_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Удалить матч", callback_data=f"adm:del_match:{match_id}")
+    kb.button(text="⬅️ К списку матчей", callback_data="adm:list_matches")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# =========================================================
+#                    ХЕНДЛЕР /start
+# =========================================================
+
+start_router = Router()
+
+
+@start_router.message(CommandStart())
+async def cmd_start(message: Message):
     text = (
-        "В данном боте нет ничего интересного, он предназначен для раскаток и всему подобному.\n"
-        "Лучше перейди и играй в нашем боте в карточки игроков Puck - @rplpuck_bot."
+        "👋 <b>Привет!</b>\n\n"
+        "В данном боте нет ничего интересного, он предназначен для раскаток "
+        "и всему подобному.\n\n"
+        f"🃏 Лучше перейди и играй в нашем боте в карточки игроков Puck — "
+        f"{PUCK_BOT_USERNAME}"
     )
-    await update.message.reply_text(text)
+    await message.answer(text)
 
-async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("Админ-панель доступна только в личных сообщениях с ботом.")
-        return ConversationHandler.END
 
-    if is_admin(update.effective_user.id):
-        await update.message.reply_text("🔑 Вы уже авторизованы в админке!", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
+# =========================================================
+#               ХЕНДЛЕРЫ ПЕРЕСЫЛКИ ИЗ КАНАЛА
+# =========================================================
 
-    await update.message.reply_text("🔑 Введите логин:")
-    return WAITING_LOGIN
+channel_router = Router()
 
-async def wait_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["login"] = update.message.text.strip()
-    await update.message.reply_text("🔒 Введите пароль:")
-    return WAITING_PASSWORD
 
-async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    login = context.user_data.get("login")
-    password = update.message.text.strip()
+def _has_allowed_hashtag(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(tag in lowered for tag in ALLOWED_HASHTAGS)
 
-    if login == ADMIN_LOGIN and password == ADMIN_PASSWORD:
-        add_admin(update.effective_user.id)
-        context.user_data.clear()
-        await update.message.reply_text("✅ Вы успешно вошли в админ-панель!", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text("❌ Неверный логин или пароль!")
-        return ConversationHandler.END
 
-# ---------- МЕНЮ АДМИНА ----------
-async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return ConversationHandler.END
-
-    text = update.message.text
-
-    if text == "🚪 Выйти из админки":
-        remove_admin(user_id)
-        await update.message.reply_text("🚪 Вы вышли из админ-панели.", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
-
-    elif text == "⚙️ Настройки сервера":
-        srv_name = get_config("server_name", "Не задано")
-        srv_ip = get_config("server_ip", "Не задано")
-        srv_port = get_config("server_port", "Не задано")
-        srv_pass = get_config("server_pass", "Не задано")
-
-        info = (
-            f"⚙️ **Текущие настройки сервера:**\n\n"
-            f"📌 Название: `{srv_name}`\n"
-            f"🌐 IP: `{srv_ip}`\n"
-            f"🔌 Порт: `{srv_port}`\n"
-            f"🔑 Пароль: `{srv_pass}`\n\n"
-            f"Введите новое **Название сервера** (или /cancel для отмены):"
-        )
-        await update.message.reply_text(info, parse_mode="Markdown")
-        return SET_SERVER_NAME
-
-    elif text == "🏒 Добавить команду/чат":
-        await update.message.reply_text(
-            "Введите **ID чата** команды (например: `-100123456789`):\n"
-            "*(Убедитесь, что бот добавлен в этот чат)*"
-        )
-        return ADD_TEAM_CHAT_ID
-
-    elif text == "🛡 Список команд":
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM teams ORDER BY team_name")
-        teams = c.fetchall()
-        conn.close()
-
-        if not teams:
-            await update.message.reply_text("📭 Команды ещё не добавлены.")
-            return
-
-        msg = "🛡 **Список привязанных команд:**\n\n"
-        for t in teams:
-            msg += f"• **{t['team_name']}** (ID чата: `{t['chat_id']}`)\n"
-
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    elif text == "📢 Настроить канал":
-        src_chan = get_config("source_channel", "Не привязан")
-        await update.message.reply_text(
-            f"📢 Текущий канал-источник: `{src_chan}`\n\n"
-            "Введите `@username` или `ID` канала (бот должен быть админом канала):",
-            parse_mode="Markdown",
-        )
-        return SET_SOURCE_CHANNEL
-
-    elif text == "⚽ Добавить матч":
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM teams ORDER BY team_name")
-        teams = c.fetchall()
-        conn.close()
-
-        if len(teams) < 2:
-            await update.message.reply_text("❌ Для создания матча нужно добавить хотя бы 2 команды!")
-            return ConversationHandler.END
-
-        buttons = [[InlineKeyboardButton(t["team_name"], callback_data=f"home_{t['id']}")] for t in teams]
-        await update.message.reply_text("🔴 **Выберите хозяев (Хозяева - ред / Команда 1):**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-        return MATCH_HOME_TEAM
-
-    elif text == "📋 Список матчей":
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("""
-            SELECT m.id, m.match_time, m.warn_45_sent, m.warn_15_sent,
-                   t1.team_name as home_team, t2.team_name as away_team
-            FROM matches m
-            JOIN teams t1 ON m.home_team_id = t1.id
-            JOIN teams t2 ON m.away_team_id = t2.id
-            WHERE m.match_time > NOW() - INTERVAL '2 hours'
-            ORDER BY m.match_time ASC
-        """)
-        matches = c.fetchall()
-        conn.close()
-
-        if not matches:
-            await update.message.reply_text("📭 Запланированных матчей нет.")
-            return
-
-        msg = "📋 **Запланированные матчи:**\n\n"
-        for m in matches:
-            t_str = m["match_time"].strftime("%d.%m.%Y %H:%M MSK")
-            msg += f"⚽ **{m['home_team']}** vs **{m['away_team']}**\n🕒 Время: `{t_str}`\n\n"
-
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-# ---------- НАСТРОЙКА СЕРВЕРА ----------
-async def set_server_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_config("server_name", update.message.text.strip())
-    await update.message.reply_text("🌐 Введите **IP сервера**:")
-    return SET_SERVER_IP
-
-async def set_server_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_config("server_ip", update.message.text.strip())
-    await update.message.reply_text("🔌 Введите **Port сервера**:")
-    return SET_SERVER_PORT
-
-async def set_server_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_config("server_port", update.message.text.strip())
-    await update.message.reply_text("🔑 Введите **Password сервера**:")
-    return SET_SERVER_PASS
-
-async def set_server_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_config("server_pass", update.message.text.strip())
-    await update.message.reply_text("✅ Данные сервера успешно сохранены!", reply_markup=admin_menu_keyboard())
-    return ConversationHandler.END
-
-# ---------- ДОБАВЛЕНИЕ КОМАНДЫ ----------
-async def add_team_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        chat_id = int(update.message.text.strip())
-        context.user_data["new_chat_id"] = chat_id
-        await update.message.reply_text("📝 Введите название клуба (например: `Динамо Москва`):", parse_mode="Markdown")
-        return ADD_TEAM_NAME
-    except ValueError:
-        await update.message.reply_text("❌ ID чата должно быть числом! Попробуйте снова:")
-        return ADD_TEAM_CHAT_ID
-
-async def add_team_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_name = update.message.text.strip()
-    chat_id = context.user_data.get("new_chat_id")
-
-    conn = get_db()
-    c = conn.cursor()
-    try:
-        c.execute("INSERT INTO teams (chat_id, team_name) VALUES (%s, %s)", (chat_id, team_name))
-        conn.commit()
-        await update.message.reply_text(f"✅ Команда **{team_name}** успешно привязана к чату `{chat_id}`!", reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка добавления: возможно данный чат уже привязан.", reply_markup=admin_menu_keyboard())
-    conn.close()
-    return ConversationHandler.END
-
-# ---------- НАСТРОЙКА КАНАЛА ----------
-async def set_source_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ch = update.message.text.strip()
-    set_config("source_channel", ch)
-    await update.message.reply_text(f"✅ Канал `{ch}` успешно привязан для пересылки постов!", reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
-    return ConversationHandler.END
-
-# ---------- ДОБАВЛЕНИЕ МАТЧА ----------
-async def match_home_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    home_id = int(query.data.split("_")[1])
-    context.user_data["home_team_id"] = home_id
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM teams WHERE id != %s ORDER BY team_name", (home_id,))
-    teams = c.fetchall()
-    conn.close()
-
-    buttons = [[InlineKeyboardButton(t["team_name"], callback_data=f"away_{t['id']}")] for t in teams]
-    await query.message.edit_text("🔵 **Выберите гостей (Гости - блу / Команда 2):**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-    return MATCH_AWAY_TEAM
-
-async def match_away_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    away_id = int(query.data.split("_")[1])
-    context.user_data["away_team_id"] = away_id
-
-    await query.message.edit_text(
-        "🕒 Введите дату и время матча по МСК в формате:\n`ДД.ММ.ГГГГ ЧЧ:ММ` или `ЧЧ:ММ` (если матч сегодня)\n\n"
-        "Пример: `25.10.2026 19:30` или `21:00`",
-        parse_mode="Markdown"
-    )
-    return MATCH_TIME
-
-async def match_time_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    now_msk = datetime.now(MSK_TZ)
-
-    try:
-        if len(text) <= 5 and ":" in text:
-            # ЧЧ:ММ (сегодня)
-            t = datetime.strptime(text, "%H:%M").time()
-            match_dt = datetime.combine(now_msk.date(), t)
-            match_dt = MSK_TZ.localize(match_dt)
-            if match_dt < now_msk:
-                match_dt += timedelta(days=1)
-        else:
-            # ДД.ММ.ГГГГ ЧЧ:ММ
-            match_dt = datetime.strptime(text, "%d.%m.%Y %H:%M")
-            match_dt = MSK_TZ.localize(match_dt)
-
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат времени! Попробуйте еще раз (например `20:00` или `15.11.2026 18:30`):")
-        return MATCH_TIME
-
-    home_id = context.user_data.get("home_team_id")
-    away_id = context.user_data.get("away_team_id")
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO matches (home_team_id, away_team_id, match_time) VALUES (%s, %s, %s)",
-        (home_id, away_id, match_dt.replace(tzinfo=None))
-    )
-    c.execute("SELECT team_name FROM teams WHERE id = %s", (home_id,))
-    h_name = c.fetchone()["team_name"]
-    c.execute("SELECT team_name FROM teams WHERE id = %s", (away_id,))
-    a_name = c.fetchone()["team_name"]
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"✅ **Матч успешно создан!**\n\n"
-        f"🔴 Хозяева (ред): **{h_name}**\n"
-        f"🔵 Гости (блу): **{a_name}**\n"
-        f"🕒 Время: `{match_dt.strftime('%d.%m.%Y %H:%M MSK')}`",
-        reply_markup=admin_menu_keyboard(),
-        parse_mode="Markdown"
-    )
-    return ConversationHandler.END
-
-# ---------- ПЕРЕСЫЛКА ПОСТОВ ИЗ КАНАЛА ----------
-async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.channel_post
-    if not msg:
+@channel_router.channel_post()
+async def on_channel_post(message: Message, bot: Bot):
+    channel = await get_channel(message.chat.id)
+    if not channel:
         return
 
-    source_chan = get_config("source_channel")
-    if not source_chan:
+    text = message.text or message.caption or ""
+    if not _has_allowed_hashtag(text):
         return
 
-    # Проверка, из того ли канала пост
-    chat = msg.chat
-    if str(chat.id) != source_chan and f"@{chat.username}" != source_chan:
-        return
-
-    text = msg.text or msg.caption or ""
-    allowed_hashtags = ["#rplpuck", "#MatchDay", "#result"]
-
-    # Проверка наличия одного из хэштегов
-    if not any(tag.lower() in text.lower() for tag in allowed_hashtags):
-        return
-
-    # Получаем все чаты команд
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT chat_id FROM teams")
-    teams = c.fetchall()
-    conn.close()
-
-    for t in teams:
+    chat_ids = await get_linked_chat_ids(message.chat.id)
+    for chat_id in chat_ids:
         try:
-            await context.bot.forward_message(
-                chat_id=t["chat_id"],
-                from_chat_id=chat.id,
-                message_id=msg.message_id
-            )
+            await bot.copy_message(chat_id=chat_id, from_chat_id=message.chat.id, message_id=message.message_id)
         except Exception as e:
-            logger.error(f"Не удалось переслать сообщение в чат {t['chat_id']}: {e}")
+            print(f"⚠️ Не удалось переслать пост в чат {chat_id}: {e}")
 
-# ---------- ФОНОВЫЙ ПЛАНИРОВЩИК УВЕДОМЛЕНИЙ (45 и 15 МИНУТ) ----------
-async def scheduler_worker(app: Application):
+
+# =========================================================
+#                     АДМИН-ПАНЕЛЬ
+# =========================================================
+
+AUTHED_ADMINS: set[int] = set()
+
+auth_router = Router()
+panel_router = Router()
+
+
+def is_authed(user_id: int) -> bool:
+    return user_id in AUTHED_ADMINS
+
+
+# ---------- авторизация ----------
+
+@auth_router.message(Command("adminkarpl"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if is_authed(message.from_user.id):
+        await message.answer("🔐 <b>Админ-панель</b>", reply_markup=admin_main_menu())
+        return
+    await state.set_state(AdminAuth.waiting_login)
+    await message.answer("🔐 Введите <b>логин</b>:")
+
+
+@auth_router.message(AdminAuth.waiting_login)
+async def process_login(message: Message, state: FSMContext):
+    if message.text != ADMIN_LOGIN:
+        await message.answer("❌ Неверный логин. Попробуйте ещё раз /adminkarpl")
+        await state.clear()
+        return
+    await state.set_state(AdminAuth.waiting_password)
+    await message.answer("🔑 Введите <b>пароль</b>:")
+
+
+@auth_router.message(AdminAuth.waiting_password)
+async def process_password(message: Message, state: FSMContext):
+    if message.text != ADMIN_PASSWORD:
+        await message.answer("❌ Неверный пароль. Попробуйте ещё раз /adminkarpl")
+        await state.clear()
+        return
+    AUTHED_ADMINS.add(message.from_user.id)
+    await state.clear()
+    await message.answer("✅ Доступ разрешён!\n\n🔐 <b>Админ-панель</b>", reply_markup=admin_main_menu())
+
+
+@panel_router.callback_query.middleware()
+async def check_authed_cb(handler, event: CallbackQuery, data):
+    if not is_authed(event.from_user.id):
+        await event.answer("⛔️ Сначала войдите: /adminkarpl", show_alert=True)
+        return
+    return await handler(event, data)
+
+
+@panel_router.message.middleware()
+async def check_authed_msg(handler, event: Message, data):
+    if not is_authed(event.from_user.id):
+        return
+    return await handler(event, data)
+
+
+# ---------- главное меню ----------
+
+@panel_router.callback_query(F.data == "adm:menu")
+async def cb_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("🔐 <b>Админ-панель</b>", reply_markup=admin_main_menu())
+    await call.answer()
+
+
+# ---------- добавление чата ----------
+
+@panel_router.callback_query(F.data == "adm:add_chat")
+async def cb_add_chat(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AddChat.waiting_id)
+    await call.message.edit_text(
+        "➕ <b>Добавление чата</b>\n\nПришлите <b>ID чата</b> (например, -1001234567890):",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
+@panel_router.message(AddChat.waiting_id)
+async def process_chat_id(message: Message, state: FSMContext):
+    try:
+        chat_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ ID должен быть числом. Попробуйте ещё раз:")
+        return
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(AddChat.waiting_name)
+    await message.answer("✏️ Теперь пришлите <b>название</b> команды/чата (например, «Динамо Москва»):")
+
+
+@panel_router.message(AddChat.waiting_name)
+async def process_chat_name(message: Message, state: FSMContext):
+    data = await state.get_data()
+    chat_id = data["chat_id"]
+    name = message.text.strip()
+    await add_chat(chat_id, name)
+    await state.clear()
+    await message.answer(f"✅ Чат <b>{name}</b> (<code>{chat_id}</code>) добавлен!", reply_markup=admin_main_menu())
+
+
+@panel_router.callback_query(F.data == "adm:list_chats")
+async def cb_list_chats(call: CallbackQuery):
+    chats = await get_chats()
+    if not chats:
+        await call.message.edit_text("📋 Пока нет ни одного чата.", reply_markup=back_to_menu_kb())
+        await call.answer()
+        return
+    lines = [f"🏒 <b>{c['name']}</b> — <code>{c['chat_id']}</code>" for c in chats]
+    await call.message.edit_text("📋 <b>Список чатов:</b>\n\n" + "\n".join(lines), reply_markup=back_to_menu_kb())
+    await call.answer()
+
+
+# ---------- добавление матча ----------
+
+@panel_router.callback_query(F.data == "adm:add_match")
+async def cb_add_match(call: CallbackQuery, state: FSMContext):
+    chats = await get_chats()
+    if len(chats) < 2:
+        await call.message.edit_text(
+            "❌ Нужно как минимум 2 добавленных чата, чтобы создать матч.",
+            reply_markup=back_to_menu_kb(),
+        )
+        await call.answer()
+        return
+    await state.set_state(AddMatch.waiting_team1)
+    await call.message.edit_text(
+        "🆚 <b>Новый матч</b>\n\n1️⃣ Выберите <b>первую команду (хозяева, ред)</b>:",
+        reply_markup=chats_choice_kb(chats, "team1"),
+    )
+    await call.answer()
+
+
+@panel_router.callback_query(AddMatch.waiting_team1, F.data.startswith("team1:"))
+async def cb_pick_team1(call: CallbackQuery, state: FSMContext):
+    chat_id = int(call.data.split(":")[1])
+    chat = await get_chat(chat_id)
+    await state.update_data(team1_id=chat_id, team1_name=chat["name"])
+
+    all_chats = await get_chats()
+    remaining = [c for c in all_chats if c["chat_id"] != chat_id]
+    await state.set_state(AddMatch.waiting_team2)
+    await call.message.edit_text(
+        f"1️⃣ Хозяева: <b>{chat['name']}</b> ✅\n\n2️⃣ Выберите <b>вторую команду (гости, блу)</b>:",
+        reply_markup=chats_choice_kb(remaining, "team2"),
+    )
+    await call.answer()
+
+
+@panel_router.callback_query(AddMatch.waiting_team2, F.data.startswith("team2:"))
+async def cb_pick_team2(call: CallbackQuery, state: FSMContext):
+    chat_id = int(call.data.split(":")[1])
+    chat = await get_chat(chat_id)
+    await state.update_data(team2_id=chat_id, team2_name=chat["name"])
+    await state.set_state(AddMatch.waiting_datetime)
+    data = await state.get_data()
+    await call.message.edit_text(
+        f"1️⃣ Хозяева: <b>{data['team1_name']}</b> ✅\n"
+        f"2️⃣ Гости: <b>{chat['name']}</b> ✅\n\n"
+        "3️⃣ Пришлите <b>дату и время матча по МСК</b> в формате:\n"
+        "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
+        "Например: <code>25.08.2026 20:30</code>",
+    )
+    await call.answer()
+
+
+@panel_router.message(AddMatch.waiting_datetime)
+async def process_match_datetime(message: Message, state: FSMContext):
+    try:
+        naive_dt = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M")
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат. Пришлите так: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\nНапример: <code>25.08.2026 20:30</code>"
+        )
+        return
+    # Считаем, что админ ввёл время по Москве — привязываем часовой пояс
+    match_time_msk = naive_dt.replace(tzinfo=MSK)
+    await state.update_data(match_time=match_time_msk.isoformat())
+    await state.set_state(AddMatch.waiting_server_name)
+    await message.answer("4️⃣ Пришлите <b>название сервера</b>:")
+
+
+@panel_router.message(AddMatch.waiting_server_name)
+async def process_server_name(message: Message, state: FSMContext):
+    await state.update_data(server_name=message.text.strip())
+    await state.set_state(AddMatch.waiting_ip)
+    await message.answer("5️⃣ Пришлите <b>IP сервера</b>:")
+
+
+@panel_router.message(AddMatch.waiting_ip)
+async def process_server_ip(message: Message, state: FSMContext):
+    await state.update_data(server_ip=message.text.strip())
+    await state.set_state(AddMatch.waiting_port)
+    await message.answer("6️⃣ Пришлите <b>Port сервера</b>:")
+
+
+@panel_router.message(AddMatch.waiting_port)
+async def process_server_port(message: Message, state: FSMContext):
+    await state.update_data(server_port=message.text.strip())
+    await state.set_state(AddMatch.waiting_password)
+    await message.answer("7️⃣ Пришлите <b>Password сервера</b>:")
+
+
+@panel_router.message(AddMatch.waiting_password)
+async def process_server_password(message: Message, state: FSMContext):
+    data = await state.get_data()
+    server_password = message.text.strip()
+
+    match = await add_match(
+        team_home_chat_id=data["team1_id"],
+        team_home_name=data["team1_name"],
+        team_away_chat_id=data["team2_id"],
+        team_away_name=data["team2_name"],
+        match_time=datetime.fromisoformat(data["match_time"]),
+        server_name=data["server_name"],
+        server_ip=data["server_ip"],
+        server_port=data["server_port"],
+        server_password=server_password,
+    )
+    await state.clear()
+
+    local_time = match["match_time"].astimezone(MSK)
+    text = (
+        "✅ <b>Матч создан!</b>\n\n"
+        f"🆚 {match['team_home_name']} — {match['team_away_name']}\n"
+        f"🕒 {local_time.strftime('%d.%m.%Y %H:%M')} МСК\n"
+        f"🖥 {match['server_name']}\n\n"
+        "Бот сам пришлёт напоминание за 45 мин. и раскатку за 15 мин. до матча 🔔"
+    )
+    await message.answer(text, reply_markup=admin_main_menu())
+
+
+# ---------- список / удаление матчей ----------
+
+@panel_router.callback_query(F.data == "adm:list_matches")
+async def cb_list_matches(call: CallbackQuery):
+    matches = await get_upcoming_matches()
+    if not matches:
+        await call.message.edit_text("📅 Ближайших матчей нет.", reply_markup=back_to_menu_kb())
+        await call.answer()
+        return
+    await call.message.edit_text(
+        "📅 <b>Ближайшие матчи</b> (время МСК, нажмите, чтобы посмотреть/удалить):",
+        reply_markup=matches_list_kb(matches),
+    )
+    await call.answer()
+
+
+@panel_router.callback_query(F.data.startswith("adm:match:"))
+async def cb_match_card(call: CallbackQuery):
+    match_id = int(call.data.split(":")[2])
+    m = await get_match(match_id)
+    if not m:
+        await call.answer("Матч не найден", show_alert=True)
+        return
+    local_time = m["match_time"].astimezone(MSK)
+    text = (
+        f"🆚 <b>{m['team_home_name']} — {m['team_away_name']}</b>\n"
+        f"🕒 {local_time.strftime('%d.%m.%Y %H:%M')} МСК\n\n"
+        f"🖥 {m['server_name']}\n"
+        f"🌐 IP: <code>{m['server_ip']}</code>\n"
+        f"🔌 Port: <code>{m['server_port']}</code>\n"
+        f"🔑 Password: <code>{m['server_password']}</code>\n\n"
+        f"🔔 45 мин: {'✅' if m['notified_45'] else '⏳'}   "
+        f"🔔 15 мин: {'✅' if m['notified_15'] else '⏳'}"
+    )
+    await call.message.edit_text(text, reply_markup=match_card_kb(match_id))
+    await call.answer()
+
+
+@panel_router.callback_query(F.data.startswith("adm:del_match:"))
+async def cb_delete_match(call: CallbackQuery):
+    match_id = int(call.data.split(":")[2])
+    await delete_match(match_id)
+    await call.answer("🗑 Матч удалён", show_alert=True)
+    matches = await get_upcoming_matches()
+    if not matches:
+        await call.message.edit_text("📅 Ближайших матчей нет.", reply_markup=back_to_menu_kb())
+        return
+    await call.message.edit_text("📅 <b>Ближайшие матчи:</b>", reply_markup=matches_list_kb(matches))
+
+
+# ---------- привязка канала ----------
+
+@panel_router.callback_query(F.data == "adm:add_channel")
+async def cb_add_channel(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AddChannel.waiting_id)
+    await call.message.edit_text(
+        "📡 <b>Привязка канала</b>\n\n"
+        "1️⃣ Пришлите <b>ID канала</b> (например, -1001234567890).\n"
+        "⚠️ Бот должен быть добавлен в канал администратором!",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
+@panel_router.message(AddChannel.waiting_id)
+async def process_channel_id(message: Message, state: FSMContext):
+    try:
+        channel_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ ID должен быть числом. Попробуйте ещё раз:")
+        return
+    await state.update_data(channel_id=channel_id)
+    await state.set_state(AddChannel.waiting_title)
+    await message.answer("✏️ Пришлите <b>название</b> канала (для себя, отображаться нигде не будет):")
+
+
+@panel_router.message(AddChannel.waiting_title)
+async def process_channel_title(message: Message, state: FSMContext):
+    data = await state.get_data()
+    title = message.text.strip()
+    await add_channel(data["channel_id"], title)
+    await state.update_data(selected=set())
+    chats = await get_chats()
+    if not chats:
+        await state.clear()
+        await message.answer(
+            "✅ Канал добавлен, но у вас пока нет ни одного чата для привязки.\n"
+            "Сначала добавьте чаты через меню.",
+            reply_markup=admin_main_menu(),
+        )
+        return
+    await state.set_state(AddChannel.waiting_chats)
+    await message.answer(
+        "2️⃣ Выберите чаты, в которые пересылать посты из канала "
+        "(#rplpuck #MatchDay #result), затем нажмите «Готово»:",
+        reply_markup=chats_multiselect_kb(chats, set()),
+    )
+
+
+@panel_router.callback_query(AddChannel.waiting_chats, F.data.startswith("cf_toggle:"))
+async def cb_toggle_chat(call: CallbackQuery, state: FSMContext):
+    chat_id = int(call.data.split(":")[1])
+    data = await state.get_data()
+    selected: set = data.get("selected", set())
+    if chat_id in selected:
+        selected.remove(chat_id)
+    else:
+        selected.add(chat_id)
+    await state.update_data(selected=selected)
+    chats = await get_chats()
+    await call.message.edit_reply_markup(reply_markup=chats_multiselect_kb(chats, selected))
+    await call.answer()
+
+
+@panel_router.callback_query(AddChannel.waiting_chats, F.data == "cf_done")
+async def cb_channel_done(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    channel_id = data["channel_id"]
+    selected: set = data.get("selected", set())
+    for chat_id in selected:
+        await link_channel_chat(channel_id, chat_id)
+    await state.clear()
+    await call.message.edit_text(f"✅ Канал привязан к {len(selected)} чат(ам)!", reply_markup=admin_main_menu())
+    await call.answer()
+
+
+@panel_router.callback_query(F.data == "adm:list_channels")
+async def cb_list_channels(call: CallbackQuery):
+    channels = await get_channels()
+    if not channels:
+        await call.message.edit_text("🔗 Пока нет привязанных каналов.", reply_markup=back_to_menu_kb())
+        await call.answer()
+        return
+    lines = []
+    for ch in channels:
+        linked = await get_linked_chats(ch["channel_id"])
+        names = ", ".join(c["name"] for c in linked) or "—"
+        lines.append(f"📡 <b>{ch['title']}</b> (<code>{ch['channel_id']}</code>)\n   ↳ чаты: {names}")
+    await call.message.edit_text("🔗 <b>Каналы:</b>\n\n" + "\n\n".join(lines), reply_markup=back_to_menu_kb())
+    await call.answer()
+
+
+# =========================================================
+#              ПЛАНИРОВЩИК НАПОМИНАНИЙ (фоновый)
+# =========================================================
+
+async def _send_safe(bot: Bot, chat_id: int, text: str):
+    try:
+        await bot.send_message(chat_id, text)
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить сообщение в чат {chat_id}: {e}")
+
+
+async def check_reminders(bot: Bot):
+    due_45 = await get_matches_due_for(REMIND_BEFORE_1, "notified_45")
+    for m in due_45:
+        text = reminder_45_text(m["team_home_name"], m["team_away_name"])
+        await _send_safe(bot, m["team_home_chat_id"], text)
+        await _send_safe(bot, m["team_away_chat_id"], text)
+        await mark_notified(m["id"], "notified_45")
+
+    due_15 = await get_matches_due_for(REMIND_BEFORE_2, "notified_15")
+    for m in due_15:
+        home_text = raskatka_text(
+            m["server_name"], m["server_ip"], m["server_port"], m["server_password"],
+            m["team_home_name"], m["team_away_name"], color="ред",
+        )
+        away_text = raskatka_text(
+            m["server_name"], m["server_ip"], m["server_port"], m["server_password"],
+            m["team_home_name"], m["team_away_name"], color="блу",
+        )
+        await _send_safe(bot, m["team_home_chat_id"], home_text)
+        await _send_safe(bot, m["team_away_chat_id"], away_text)
+        await mark_notified(m["id"], "notified_15")
+
+
+async def scheduler_loop(bot: Bot):
     while True:
         try:
-            now_utc = datetime.utcnow()
-            conn = get_db()
-            c = conn.cursor()
-
-            # Получаем предстоящие матчи
-            c.execute("""
-                SELECT m.id, m.match_time, m.warn_45_sent, m.warn_15_sent,
-                       t1.chat_id as home_chat, t1.team_name as home_name,
-                       t2.chat_id as away_chat, t2.team_name as away_name
-                FROM matches m
-                JOIN teams t1 ON m.home_team_id = t1.id
-                JOIN teams t2 ON m.away_team_id = t2.id
-                WHERE m.match_time > NOW() - INTERVAL '1 hour'
-                  AND (m.warn_45_sent = FALSE OR m.warn_15_sent = FALSE)
-            """)
-            matches = c.fetchall()
-
-            for m in matches:
-                m_time = m["match_time"]
-                diff_minutes = (m_time - now_utc).total_seconds() / 60.0
-
-                # Настройки сервера
-                srv_name = get_config("server_name", "Не указано")
-                srv_ip = get_config("server_ip", "Не указано")
-                srv_port = get_config("server_port", "Не указано")
-                srv_pass = get_config("server_pass", "Не указано")
-
-                # --- 45 МИНУТ ДО МАТЧА ---
-                if 40.0 <= diff_minutes <= 45.0 and not m["warn_45_sent"]:
-                    msg_45 = "Внимание, до матча осталось 45 минут. Не забудьте прийти!"
-                    for chat_id in [m["home_chat"], m["away_chat"]]:
-                        try:
-                            await app.bot.send_message(chat_id=chat_id, text=msg_45)
-                        except Exception as e:
-                            logger.error(f"Ошибка отправки 45 мин в {chat_id}: {e}")
-
-                    c.execute("UPDATE matches SET warn_45_sent = TRUE WHERE id = %s", (m["id"],))
-                    conn.commit()
-
-                # --- 15 МИНУТ ДО МАТЧА ---
-                if 10.0 <= diff_minutes <= 15.0 and not m["warn_15_sent"]:
-                    # Сообщение Хозяевам (Красные)
-                    msg_home = (
-                        f"калл Раскатка!\n"
-                        f"{srv_name}\n"
-                        f"IP сервера: {srv_ip}\n"
-                        f"Port сервера: {srv_port}\n"
-                        f"Password сервера: {srv_pass}\n\n"
-                        f"Вы ред."
-                    )
-                    # Сообщение Гостям (Синие)
-                    msg_away = (
-                        f"калл Раскатка!\n"
-                        f"{srv_name}\n"
-                        f"IP сервера: {srv_ip}\n"
-                        f"Port сервера: {srv_port}\n"
-                        f"Password сервера: {srv_pass}\n\n"
-                        f"Вы блу."
-                    )
-
-                    try:
-                        await app.bot.send_message(chat_id=m["home_chat"], text=msg_home)
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки 15 мин хозяевам {m['home_chat']}: {e}")
-
-                    try:
-                        await app.bot.send_message(chat_id=m["away_chat"], text=msg_away)
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки 15 мин гостям {m['away_chat']}: {e}")
-
-                    c.execute("UPDATE matches SET warn_15_sent = TRUE WHERE id = %s", (m["id"],))
-                    conn.commit()
-
-            conn.close()
+            await check_reminders(bot)
         except Exception as e:
-            logger.error(f"Ошибка в работы планировщика: {e}")
+            print(f"⚠️ Ошибка в планировщике: {e}")
+        await asyncio.sleep(SCHEDULER_INTERVAL)
 
-        await asyncio.sleep(25)
 
-async def post_init(app: Application):
-    init_db()
-    asyncio.create_task(scheduler_worker(app))
+# =========================================================
+#                          MAIN
+# =========================================================
 
-# ---------- MAIN ----------
-def main():
-    if not TOKEN:
-        raise ValueError("BOT_TOKEN не задан в переменных окружения!")
+async def main():
+    logging.basicConfig(level=logging.INFO)
+
+    if not BOT_TOKEN:
+        raise RuntimeError("❌ Не задан BOT_TOKEN в переменных окружения!")
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL не задан в переменных окружения!")
+        raise RuntimeError("❌ Не задан DATABASE_URL в переменных окружения!")
 
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
 
-    # Админ диалог
-    conv_admin = ConversationHandler(
-        entry_points=[CommandHandler("adminkarpl", adminkarpl)],
-        states={
-            WAITING_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_login)],
-            WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_password)],
-            # Выбор команд и чатов
-            ADD_TEAM_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_team_chat_id)],
-            ADD_TEAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_team_name)],
-            # Настройка сервера
-            SET_SERVER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_server_name)],
-            SET_SERVER_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_server_ip)],
-            SET_SERVER_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_server_port)],
-            SET_SERVER_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_server_pass)],
-            # Настройка канала
-            SET_SOURCE_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_source_channel)],
-            # Создание матча
-            MATCH_HOME_TEAM: [CallbackQueryHandler(match_home_selected, pattern="^home_")],
-            MATCH_AWAY_TEAM: [CallbackQueryHandler(match_away_selected, pattern="^away_")],
-            MATCH_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, match_time_received)],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Отменено.", reply_markup=admin_menu_keyboard()))],
-        per_message=False
-    )
+    dp.include_router(start_router)
+    dp.include_router(auth_router)
+    dp.include_router(panel_router)
+    dp.include_router(channel_router)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_admin)
+    await init_pool()
+    logging.info("✅ База данных подключена и готова")
 
-    # Обработчик кнопок админ-панели
-    app.add_handler(MessageHandler(filters.Regex("^(⚽ Добавить матч|📋 Список матчей|🏒 Добавить команду/чат|🛡 Список команд|⚙️ Настройки сервера|📢 Настроить канал|🚪 Выйти из админки)$") & filters.ChatType.PRIVATE, admin_button_handler))
+    asyncio.create_task(scheduler_loop(bot))
+    logging.info("✅ Планировщик напоминаний запущен (часовой пояс МСК)")
 
-    # Обработчик постов из каналов
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post_handler))
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("🚀 Бот запущен, начинаю polling...")
+    await dp.start_polling(bot)
 
-    logger.info("Бот раскаток запущен...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
