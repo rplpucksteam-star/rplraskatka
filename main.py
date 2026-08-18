@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from html import escape
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -14,7 +15,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, ErrorEvent
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # =========================================================
@@ -37,7 +38,15 @@ PUCK_BOT_USERNAME = "@rplpuck_bot"
 
 SCHEDULER_INTERVAL = 20  # сек, как часто проверять базу на напоминания
 
-MSK = ZoneInfo("Europe/Moscow")  # 🕒 часовой пояс, в котором админ вводит время матча
+MSK = ZoneInfo("Europe/Moscow")  # 🕒 часовой пояс, в котором вводится время матча
+
+
+def esc(value) -> str:
+    """Экранирует пользовательский текст перед вставкой в HTML-сообщение.
+    Без этого пароль/IP с символами <, >, & ломал парсинг Telegram и бот
+    'зависал' (сообщение не уходило, а исключение никто не ловил)."""
+    return escape(str(value))
+
 
 # =========================================================
 #                        БАЗА ДАННЫХ
@@ -48,7 +57,8 @@ _pool: asyncpg.Pool | None = None
 
 async def init_pool():
     global _pool
-    _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
+    # command_timeout — чтобы зависший запрос обрывался сам, а не морозил бота навсегда
+    _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5, command_timeout=15)
     async with _pool.acquire() as conn:
         await conn.execute(
             """
@@ -69,6 +79,15 @@ async def init_pool():
                 channel_id BIGINT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
                 chat_id BIGINT NOT NULL,
                 UNIQUE(channel_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS servers (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                port TEXT NOT NULL,
+                password TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS matches (
@@ -166,6 +185,31 @@ async def get_linked_chat_ids(channel_id: int):
         return {r["chat_id"] for r in rows}
 
 
+# ---------- SERVERS (пресеты серверов для матчей) ----------
+
+async def add_server(name: str, ip: str, port: str, password: str):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            "INSERT INTO servers (name, ip, port, password) VALUES ($1,$2,$3,$4) RETURNING *",
+            name, ip, port, password,
+        )
+
+
+async def get_servers():
+    async with _pool.acquire() as conn:
+        return await conn.fetch("SELECT * FROM servers ORDER BY id DESC")
+
+
+async def get_server(server_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM servers WHERE id = $1", server_id)
+
+
+async def delete_server(server_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM servers WHERE id = $1", server_id)
+
+
 # ---------- MATCHES ----------
 
 async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
@@ -227,21 +271,21 @@ def reminder_45_text(team_home: str, team_away: str) -> str:
     return (
         "⏰ <b>Внимание, до матча осталось 45 минут!</b>\n"
         "Не забудьте прийти! 🙌\n\n"
-        f"🆚 {team_home} — {team_away}"
+        f"🆚 {esc(team_home)} — {esc(team_away)}"
     )
 
 
 def raskatka_text(server_name, server_ip, server_port, server_password, team_home, team_away, color) -> str:
     return (
         "🎮 <b>Калл! Раскатка!</b>\n\n"
-        f"🖥 <b>{server_name}</b>\n"
-        f"🌐 IP сервера: <code>{server_ip}</code>\n"
-        f"🔌 Port сервера: <code>{server_port}</code>\n"
-        f"🔑 Password сервера: <code>{server_password}</code>\n\n"
+        f"🖥 <b>{esc(server_name)}</b>\n"
+        f"🌐 IP сервера: <code>{esc(server_ip)}</code>\n"
+        f"🔌 Port сервера: <code>{esc(server_port)}</code>\n"
+        f"🔑 Password сервера: <code>{esc(server_password)}</code>\n\n"
         f"👉 Вы {color}.\n\n"
         "ℹ️ Если что:\n"
-        f"🔴 Хозяева — ред ({team_home})\n"
-        f"🔵 Гости — блу ({team_away})"
+        f"🔴 Хозяева — ред ({esc(team_home)})\n"
+        f"🔵 Гости — блу ({esc(team_away)})"
     )
 
 
@@ -259,14 +303,18 @@ class AddChat(StatesGroup):
     waiting_name = State()
 
 
+class AddServer(StatesGroup):
+    waiting_name = State()
+    waiting_ip = State()
+    waiting_port = State()
+    waiting_password = State()
+
+
 class AddMatch(StatesGroup):
     waiting_team1 = State()
     waiting_team2 = State()
     waiting_datetime = State()
-    waiting_server_name = State()
-    waiting_ip = State()
-    waiting_port = State()
-    waiting_password = State()
+    waiting_server = State()  # выбор сервера из сохранённых (кнопкой)
 
 
 class AddChannel(StatesGroup):
@@ -285,9 +333,11 @@ def admin_main_menu() -> InlineKeyboardMarkup:
     kb.button(text="📋 Список чатов", callback_data="adm:list_chats")
     kb.button(text="🆚 Добавить матч", callback_data="adm:add_match")
     kb.button(text="📅 Список матчей", callback_data="adm:list_matches")
+    kb.button(text="🖥 Добавить сервер", callback_data="adm:add_server")
+    kb.button(text="🗄 Список серверов", callback_data="adm:list_servers")
     kb.button(text="📡 Привязать канал", callback_data="adm:add_channel")
     kb.button(text="🔗 Список каналов", callback_data="adm:list_channels")
-    kb.adjust(1)
+    kb.adjust(2)
     return kb.as_markup()
 
 
@@ -331,6 +381,26 @@ def match_card_kb(match_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🗑 Удалить матч", callback_data=f"adm:del_match:{match_id}")
     kb.button(text="⬅️ К списку матчей", callback_data="adm:list_matches")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def servers_choice_kb(servers) -> InlineKeyboardMarkup:
+    """Клавиатура выбора сервера при создании матча."""
+    kb = InlineKeyboardBuilder()
+    for s in servers:
+        kb.button(text=f"🖥 {s['name']} ({s['ip']}:{s['port']})", callback_data=f"srv:{s['id']}")
+    kb.button(text="➕ Новый сервер", callback_data="adm:add_server_inline")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def servers_list_kb(servers) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for s in servers:
+        kb.button(text=f"🗑 {s['name']} ({s['ip']}:{s['port']})", callback_data=f"adm:del_server:{s['id']}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -383,7 +453,7 @@ async def on_channel_post(message: Message, bot: Bot):
         try:
             await bot.copy_message(chat_id=chat_id, from_chat_id=message.chat.id, message_id=message.message_id)
         except Exception as e:
-            print(f"⚠️ Не удалось переслать пост в чат {chat_id}: {e}")
+            logging.warning(f"⚠️ Не удалось переслать пост в чат {chat_id}: {e}")
 
 
 # =========================================================
@@ -487,7 +557,7 @@ async def process_chat_name(message: Message, state: FSMContext):
     name = message.text.strip()
     await add_chat(chat_id, name)
     await state.clear()
-    await message.answer(f"✅ Чат <b>{name}</b> (<code>{chat_id}</code>) добавлен!", reply_markup=admin_main_menu())
+    await message.answer(f"✅ Чат <b>{esc(name)}</b> (<code>{chat_id}</code>) добавлен!", reply_markup=admin_main_menu())
 
 
 @panel_router.callback_query(F.data == "adm:list_chats")
@@ -497,9 +567,116 @@ async def cb_list_chats(call: CallbackQuery):
         await call.message.edit_text("📋 Пока нет ни одного чата.", reply_markup=back_to_menu_kb())
         await call.answer()
         return
-    lines = [f"🏒 <b>{c['name']}</b> — <code>{c['chat_id']}</code>" for c in chats]
+    lines = [f"🏒 <b>{esc(c['name'])}</b> — <code>{c['chat_id']}</code>" for c in chats]
     await call.message.edit_text("📋 <b>Список чатов:</b>\n\n" + "\n".join(lines), reply_markup=back_to_menu_kb())
     await call.answer()
+
+
+# ---------- добавление сервера (отдельная, самостоятельная кнопка) ----------
+
+@panel_router.callback_query(F.data == "adm:add_server")
+async def cb_add_server(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AddServer.waiting_name)
+    await call.message.edit_text(
+        "🖥 <b>Новый сервер</b>\n\n1️⃣ Пришлите <b>название</b> сервера (например, «Сервер #1»):",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
+# тот же флоу, но запущенный кнопкой "➕ Новый сервер" прямо во время создания матча
+@panel_router.callback_query(AddMatch.waiting_server, F.data == "adm:add_server_inline")
+async def cb_add_server_inline(call: CallbackQuery, state: FSMContext):
+    await state.update_data(resume_match=True)
+    await state.set_state(AddServer.waiting_name)
+    await call.message.edit_text("🖥 <b>Новый сервер</b>\n\n1️⃣ Пришлите <b>название</b> сервера:")
+    await call.answer()
+
+
+@panel_router.message(AddServer.waiting_name)
+async def process_server_name(message: Message, state: FSMContext):
+    await state.update_data(srv_name=message.text.strip())
+    await state.set_state(AddServer.waiting_ip)
+    await message.answer("2️⃣ Пришлите <b>IP</b> сервера:")
+
+
+@panel_router.message(AddServer.waiting_ip)
+async def process_server_ip(message: Message, state: FSMContext):
+    await state.update_data(srv_ip=message.text.strip())
+    await state.set_state(AddServer.waiting_port)
+    await message.answer("3️⃣ Пришлите <b>Port</b> сервера:")
+
+
+@panel_router.message(AddServer.waiting_port)
+async def process_server_port(message: Message, state: FSMContext):
+    await state.update_data(srv_port=message.text.strip())
+    await state.set_state(AddServer.waiting_password)
+    await message.answer("4️⃣ Пришлите <b>Password</b> сервера:")
+
+
+@panel_router.message(AddServer.waiting_password)
+async def process_server_password(message: Message, state: FSMContext):
+    data = await state.get_data()
+    password = message.text.strip()
+    server = await add_server(data["srv_name"], data["srv_ip"], data["srv_port"], password)
+
+    # Если сервер создавался прямо посреди создания матча — сразу используем его и завершаем матч
+    if data.get("resume_match"):
+        match = await add_match(
+            team_home_chat_id=data["team1_id"],
+            team_home_name=data["team1_name"],
+            team_away_chat_id=data["team2_id"],
+            team_away_name=data["team2_name"],
+            match_time=datetime.fromisoformat(data["match_time"]),
+            server_name=server["name"],
+            server_ip=server["ip"],
+            server_port=server["port"],
+            server_password=server["password"],
+        )
+        await state.clear()
+        local_time = match["match_time"].astimezone(MSK)
+        text = (
+            "✅ <b>Сервер сохранён и матч создан!</b>\n\n"
+            f"🆚 {esc(match['team_home_name'])} — {esc(match['team_away_name'])}\n"
+            f"🕒 {local_time.strftime('%d.%m.%Y %H:%M')} МСК\n"
+            f"🖥 {esc(match['server_name'])}\n\n"
+            "Бот сам пришлёт напоминание за 45 мин. и раскатку за 15 мин. до матча 🔔"
+        )
+        await message.answer(text, reply_markup=admin_main_menu())
+        return
+
+    await state.clear()
+    await message.answer(
+        f"✅ Сервер <b>{esc(server['name'])}</b> сохранён!\n"
+        "Теперь он будет доступен для выбора при создании матчей. 🖥",
+        reply_markup=admin_main_menu(),
+    )
+
+
+@panel_router.callback_query(F.data == "adm:list_servers")
+async def cb_list_servers(call: CallbackQuery):
+    servers = await get_servers()
+    if not servers:
+        await call.message.edit_text("🗄 Пока нет сохранённых серверов.", reply_markup=back_to_menu_kb())
+        await call.answer()
+        return
+    await call.message.edit_text(
+        "🗄 <b>Серверы</b> (нажмите на сервер, чтобы удалить):",
+        reply_markup=servers_list_kb(servers),
+    )
+    await call.answer()
+
+
+@panel_router.callback_query(F.data.startswith("adm:del_server:"))
+async def cb_delete_server(call: CallbackQuery):
+    server_id = int(call.data.split(":")[2])
+    await delete_server(server_id)
+    await call.answer("🗑 Сервер удалён", show_alert=True)
+    servers = await get_servers()
+    if not servers:
+        await call.message.edit_text("🗄 Пока нет сохранённых серверов.", reply_markup=back_to_menu_kb())
+        return
+    await call.message.edit_text("🗄 <b>Серверы:</b>", reply_markup=servers_list_kb(servers))
 
 
 # ---------- добавление матча ----------
@@ -532,7 +709,7 @@ async def cb_pick_team1(call: CallbackQuery, state: FSMContext):
     remaining = [c for c in all_chats if c["chat_id"] != chat_id]
     await state.set_state(AddMatch.waiting_team2)
     await call.message.edit_text(
-        f"1️⃣ Хозяева: <b>{chat['name']}</b> ✅\n\n2️⃣ Выберите <b>вторую команду (гости, блу)</b>:",
+        f"1️⃣ Хозяева: <b>{esc(chat['name'])}</b> ✅\n\n2️⃣ Выберите <b>вторую команду (гости, блу)</b>:",
         reply_markup=chats_choice_kb(remaining, "team2"),
     )
     await call.answer()
@@ -546,8 +723,8 @@ async def cb_pick_team2(call: CallbackQuery, state: FSMContext):
     await state.set_state(AddMatch.waiting_datetime)
     data = await state.get_data()
     await call.message.edit_text(
-        f"1️⃣ Хозяева: <b>{data['team1_name']}</b> ✅\n"
-        f"2️⃣ Гости: <b>{chat['name']}</b> ✅\n\n"
+        f"1️⃣ Хозяева: <b>{esc(data['team1_name'])}</b> ✅\n"
+        f"2️⃣ Гости: <b>{esc(chat['name'])}</b> ✅\n\n"
         "3️⃣ Пришлите <b>дату и время матча по МСК</b> в формате:\n"
         "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
         "Например: <code>25.08.2026 20:30</code>",
@@ -567,35 +744,30 @@ async def process_match_datetime(message: Message, state: FSMContext):
     # Считаем, что админ ввёл время по Москве — привязываем часовой пояс
     match_time_msk = naive_dt.replace(tzinfo=MSK)
     await state.update_data(match_time=match_time_msk.isoformat())
-    await state.set_state(AddMatch.waiting_server_name)
-    await message.answer("4️⃣ Пришлите <b>название сервера</b>:")
+
+    servers = await get_servers()
+    if not servers:
+        # серверов ещё нет — сразу предлагаем создать первый, не выходя из мастера матча
+        await state.update_data(resume_match=True)
+        await state.set_state(AddServer.waiting_name)
+        await message.answer(
+            "🖥 Сохранённых серверов пока нет — самое время добавить первый!\n\n"
+            "1️⃣ Пришлите <b>название</b> сервера:"
+        )
+        return
+
+    await state.set_state(AddMatch.waiting_server)
+    await message.answer("4️⃣ Выберите <b>сервер</b> для этого матча:", reply_markup=servers_choice_kb(servers))
 
 
-@panel_router.message(AddMatch.waiting_server_name)
-async def process_server_name(message: Message, state: FSMContext):
-    await state.update_data(server_name=message.text.strip())
-    await state.set_state(AddMatch.waiting_ip)
-    await message.answer("5️⃣ Пришлите <b>IP сервера</b>:")
-
-
-@panel_router.message(AddMatch.waiting_ip)
-async def process_server_ip(message: Message, state: FSMContext):
-    await state.update_data(server_ip=message.text.strip())
-    await state.set_state(AddMatch.waiting_port)
-    await message.answer("6️⃣ Пришлите <b>Port сервера</b>:")
-
-
-@panel_router.message(AddMatch.waiting_port)
-async def process_server_port(message: Message, state: FSMContext):
-    await state.update_data(server_port=message.text.strip())
-    await state.set_state(AddMatch.waiting_password)
-    await message.answer("7️⃣ Пришлите <b>Password сервера</b>:")
-
-
-@panel_router.message(AddMatch.waiting_password)
-async def process_server_password(message: Message, state: FSMContext):
+@panel_router.callback_query(AddMatch.waiting_server, F.data.startswith("srv:"))
+async def cb_pick_server(call: CallbackQuery, state: FSMContext):
+    server_id = int(call.data.split(":")[1])
+    server = await get_server(server_id)
+    if not server:
+        await call.answer("Сервер не найден", show_alert=True)
+        return
     data = await state.get_data()
-    server_password = message.text.strip()
 
     match = await add_match(
         team_home_chat_id=data["team1_id"],
@@ -603,22 +775,23 @@ async def process_server_password(message: Message, state: FSMContext):
         team_away_chat_id=data["team2_id"],
         team_away_name=data["team2_name"],
         match_time=datetime.fromisoformat(data["match_time"]),
-        server_name=data["server_name"],
-        server_ip=data["server_ip"],
-        server_port=data["server_port"],
-        server_password=server_password,
+        server_name=server["name"],
+        server_ip=server["ip"],
+        server_port=server["port"],
+        server_password=server["password"],
     )
     await state.clear()
 
     local_time = match["match_time"].astimezone(MSK)
     text = (
         "✅ <b>Матч создан!</b>\n\n"
-        f"🆚 {match['team_home_name']} — {match['team_away_name']}\n"
+        f"🆚 {esc(match['team_home_name'])} — {esc(match['team_away_name'])}\n"
         f"🕒 {local_time.strftime('%d.%m.%Y %H:%M')} МСК\n"
-        f"🖥 {match['server_name']}\n\n"
+        f"🖥 {esc(match['server_name'])}\n\n"
         "Бот сам пришлёт напоминание за 45 мин. и раскатку за 15 мин. до матча 🔔"
     )
-    await message.answer(text, reply_markup=admin_main_menu())
+    await call.message.edit_text(text, reply_markup=admin_main_menu())
+    await call.answer()
 
 
 # ---------- список / удаление матчей ----------
@@ -646,12 +819,12 @@ async def cb_match_card(call: CallbackQuery):
         return
     local_time = m["match_time"].astimezone(MSK)
     text = (
-        f"🆚 <b>{m['team_home_name']} — {m['team_away_name']}</b>\n"
+        f"🆚 <b>{esc(m['team_home_name'])} — {esc(m['team_away_name'])}</b>\n"
         f"🕒 {local_time.strftime('%d.%m.%Y %H:%M')} МСК\n\n"
-        f"🖥 {m['server_name']}\n"
-        f"🌐 IP: <code>{m['server_ip']}</code>\n"
-        f"🔌 Port: <code>{m['server_port']}</code>\n"
-        f"🔑 Password: <code>{m['server_password']}</code>\n\n"
+        f"🖥 {esc(m['server_name'])}\n"
+        f"🌐 IP: <code>{esc(m['server_ip'])}</code>\n"
+        f"🔌 Port: <code>{esc(m['server_port'])}</code>\n"
+        f"🔑 Password: <code>{esc(m['server_password'])}</code>\n\n"
         f"🔔 45 мин: {'✅' if m['notified_45'] else '⏳'}   "
         f"🔔 15 мин: {'✅' if m['notified_15'] else '⏳'}"
     )
@@ -757,8 +930,8 @@ async def cb_list_channels(call: CallbackQuery):
     lines = []
     for ch in channels:
         linked = await get_linked_chats(ch["channel_id"])
-        names = ", ".join(c["name"] for c in linked) or "—"
-        lines.append(f"📡 <b>{ch['title']}</b> (<code>{ch['channel_id']}</code>)\n   ↳ чаты: {names}")
+        names = ", ".join(esc(c["name"]) for c in linked) or "—"
+        lines.append(f"📡 <b>{esc(ch['title'])}</b> (<code>{ch['channel_id']}</code>)\n   ↳ чаты: {names}")
     await call.message.edit_text("🔗 <b>Каналы:</b>\n\n" + "\n\n".join(lines), reply_markup=back_to_menu_kb())
     await call.answer()
 
@@ -771,7 +944,7 @@ async def _send_safe(bot: Bot, chat_id: int, text: str):
     try:
         await bot.send_message(chat_id, text)
     except Exception as e:
-        print(f"⚠️ Не удалось отправить сообщение в чат {chat_id}: {e}")
+        logging.warning(f"⚠️ Не удалось отправить сообщение в чат {chat_id}: {e}")
 
 
 async def check_reminders(bot: Bot):
@@ -802,7 +975,7 @@ async def scheduler_loop(bot: Bot):
         try:
             await check_reminders(bot)
         except Exception as e:
-            print(f"⚠️ Ошибка в планировщике: {e}")
+            logging.warning(f"⚠️ Ошибка в планировщике: {e}")
         await asyncio.sleep(SCHEDULER_INTERVAL)
 
 
@@ -825,6 +998,23 @@ async def main():
     dp.include_router(auth_router)
     dp.include_router(panel_router)
     dp.include_router(channel_router)
+
+    # Глобальный обработчик ошибок — чтобы бот больше НИКОГДА не "зависал" молча.
+    # Любое неотловленное исключение логируется и юзер получает понятный ответ.
+    @dp.errors()
+    async def global_error_handler(event: ErrorEvent):
+        logging.exception("Необработанная ошибка при обработке апдейта", exc_info=event.exception)
+        try:
+            update = event.update
+            if update.message:
+                await update.message.answer("⚠️ Произошла ошибка. Попробуйте ещё раз или начните заново: /adminkarpl")
+            elif update.callback_query:
+                await update.callback_query.message.answer(
+                    "⚠️ Произошла ошибка. Попробуйте ещё раз или начните заново: /adminkarpl"
+                )
+        except Exception:
+            pass
+        return True
 
     await init_pool()
     logging.info("✅ База данных подключена и готова")
