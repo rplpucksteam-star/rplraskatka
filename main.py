@@ -614,6 +614,7 @@ async def process_server_port(message: Message, state: FSMContext):
     await message.answer("4️⃣ Пришлите <b>Password</b> сервера:")
 
 
+# ===== ИСПРАВЛЕННАЯ ФУНКЦИЯ =====
 @panel_router.message(AddServer.waiting_password)
 async def process_server_password(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -622,17 +623,47 @@ async def process_server_password(message: Message, state: FSMContext):
 
     # Если сервер создавался прямо посреди создания матча — сразу используем его и завершаем матч
     if data.get("resume_match"):
-        match = await add_match(
-            team_home_chat_id=data["team1_id"],
-            team_home_name=data["team1_name"],
-            team_away_chat_id=data["team2_id"],
-            team_away_name=data["team2_name"],
-            match_time=datetime.fromisoformat(data["match_time"]),
-            server_name=server["name"],
-            server_ip=server["ip"],
-            server_port=server["port"],
-            server_password=server["password"],
-        )
+        # Проверяем наличие всех данных для матча
+        required = ("team1_id", "team1_name", "team2_id", "team2_name", "match_time")
+        if not all(key in data for key in required):
+            await state.clear()
+            await message.answer(
+                "❌ Данные о матче утеряны. Пожалуйста, начните заново: /adminkarpl",
+                reply_markup=admin_main_menu(),
+            )
+            return
+
+        try:
+            match_time = datetime.fromisoformat(data["match_time"])
+        except ValueError:
+            await state.clear()
+            await message.answer(
+                "❌ Неверный формат даты. Начните создание матча заново: /adminkarpl",
+                reply_markup=admin_main_menu(),
+            )
+            return
+
+        try:
+            match = await add_match(
+                team_home_chat_id=data["team1_id"],
+                team_home_name=data["team1_name"],
+                team_away_chat_id=data["team2_id"],
+                team_away_name=data["team2_name"],
+                match_time=match_time,
+                server_name=server["name"],
+                server_ip=server["ip"],
+                server_port=server["port"],
+                server_password=server["password"],
+            )
+        except Exception as e:
+            logging.exception("Ошибка при сохранении матча после создания сервера")
+            await state.clear()
+            await message.answer(
+                "❌ Не удалось сохранить матч. Попробуйте ещё раз.",
+                reply_markup=admin_main_menu(),
+            )
+            return
+
         await state.clear()
         local_time = match["match_time"].astimezone(MSK)
         text = (
@@ -645,6 +676,7 @@ async def process_server_password(message: Message, state: FSMContext):
         await message.answer(text, reply_markup=admin_main_menu())
         return
 
+    # Обычное добавление сервера (не в процессе матча)
     await state.clear()
     await message.answer(
         f"✅ Сервер <b>{esc(server['name'])}</b> сохранён!\n"
@@ -760,6 +792,7 @@ async def process_match_datetime(message: Message, state: FSMContext):
     await message.answer("4️⃣ Выберите <b>сервер</b> для этого матча:", reply_markup=servers_choice_kb(servers))
 
 
+# ===== ИСПРАВЛЕННАЯ ФУНКЦИЯ =====
 @panel_router.callback_query(AddMatch.waiting_server, F.data.startswith("srv:"))
 async def cb_pick_server(call: CallbackQuery, state: FSMContext):
     server_id = int(call.data.split(":")[1])
@@ -767,21 +800,53 @@ async def cb_pick_server(call: CallbackQuery, state: FSMContext):
     if not server:
         await call.answer("Сервер не найден", show_alert=True)
         return
+
     data = await state.get_data()
+    # Проверяем, что все необходимые данные есть в состоянии
+    required = ("team1_id", "team1_name", "team2_id", "team2_name", "match_time")
+    if not all(key in data for key in required):
+        await state.clear()
+        await call.message.edit_text(
+            "❌ Данные о матче утеряны. Пожалуйста, начните заново: /adminkarpl",
+            reply_markup=back_to_menu_kb(),
+        )
+        await call.answer()
+        return
 
-    match = await add_match(
-        team_home_chat_id=data["team1_id"],
-        team_home_name=data["team1_name"],
-        team_away_chat_id=data["team2_id"],
-        team_away_name=data["team2_name"],
-        match_time=datetime.fromisoformat(data["match_time"]),
-        server_name=server["name"],
-        server_ip=server["ip"],
-        server_port=server["port"],
-        server_password=server["password"],
-    )
+    try:
+        match_time = datetime.fromisoformat(data["match_time"])
+    except ValueError:
+        await state.clear()
+        await call.message.edit_text(
+            "❌ Неверный формат даты. Начните создание матча заново: /adminkarpl",
+            reply_markup=back_to_menu_kb(),
+        )
+        await call.answer()
+        return
+
+    try:
+        match = await add_match(
+            team_home_chat_id=data["team1_id"],
+            team_home_name=data["team1_name"],
+            team_away_chat_id=data["team2_id"],
+            team_away_name=data["team2_name"],
+            match_time=match_time,
+            server_name=server["name"],
+            server_ip=server["ip"],
+            server_port=server["port"],
+            server_password=server["password"],
+        )
+    except Exception as e:
+        logging.exception("Ошибка при сохранении матча")
+        await state.clear()
+        await call.message.edit_text(
+            "❌ Не удалось сохранить матч в базе данных. Попробуйте ещё раз.",
+            reply_markup=back_to_menu_kb(),
+        )
+        await call.answer()
+        return
+
     await state.clear()
-
     local_time = match["match_time"].astimezone(MSK)
     text = (
         "✅ <b>Матч создан!</b>\n\n"
