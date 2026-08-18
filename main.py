@@ -56,7 +56,6 @@ async def init_pool():
     global _pool
     _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5, command_timeout=15)
     async with _pool.acquire() as conn:
-        # Создаём таблицы, если их нет
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS chats (
@@ -124,7 +123,7 @@ async def init_pool():
             try:
                 await conn.execute(cmd)
             except asyncpg.exceptions.DuplicateColumnError:
-                pass  # колонка уже существует
+                pass
             except Exception as e:
                 logging.warning(f"Не удалось выполнить ALTER: {e}")
 
@@ -226,9 +225,11 @@ async def delete_server(server_id: int):
 
 async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
                      match_time, server_name, server_ip, server_port, server_password):
-    # Приводим время к UTC
+    # Приводим время к UTC и преобразуем в строку ISO
     if match_time.tzinfo is not None:
         match_time = match_time.astimezone(timezone.utc)
+    match_time_str = match_time.isoformat()  # '2026-08-18T16:00:00+00:00'
+
     async with _pool.acquire() as conn:
         return await conn.fetchrow(
             """
@@ -236,11 +237,11 @@ async def add_match(team_home_chat_id, team_home_name, team_away_chat_id, team_a
                 team_home_chat_id, team_home_name,
                 team_away_chat_id, team_away_name,
                 match_time, server_name, server_ip, server_port, server_password
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ) VALUES ($1,$2,$3,$4,$5::timestamptz,$6,$7,$8,$9)
             RETURNING *
             """,
             team_home_chat_id, team_home_name, team_away_chat_id, team_away_name,
-            match_time, server_name, server_ip, server_port, server_password,
+            match_time_str, server_name, server_ip, server_port, server_password,
         )
 
 
