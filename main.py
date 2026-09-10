@@ -45,6 +45,7 @@ PUCK_BOT_USERNAME = "@rplpuck_bot"
 
 SCHEDULER_INTERVAL = 20
 WARNING_AUTODELETE_SECONDS = 10
+ADMIN_RIGHTS_CHECK_INTERVAL = 300  # 5 минут
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -386,6 +387,18 @@ async def get_player_chat_ids(tg_id: int) -> list[int]:
     async with _pool.acquire() as conn:
         rows = await conn.fetch("SELECT chat_id FROM player_chats WHERE tg_id = $1", tg_id)
         return [r["chat_id"] for r in rows]
+
+
+async def get_linked_player_ids(chat_id: int) -> set[int]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT tg_id FROM player_chats WHERE chat_id = $1", chat_id)
+        return {r["tg_id"] for r in rows}
+
+
+async def get_all_known_player_ids() -> list[int]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT tg_id FROM players")
+        return [r["tg_id"] for r in rows]
 
 
 async def get_team_roster(chat_id: int):
@@ -1542,6 +1555,65 @@ async def send_and_autodelete(bot: Bot, chat_id: int, text: str, delay: int = WA
     asyncio.create_task(_delete_later())
 
 
+@team_chat_router.message(Command("checkplayers"))
+async def cmd_checkplayers(message: Message, bot: Bot):
+    chat = await get_chat(message.chat.id)
+    if not chat:
+        return
+
+    # Команда доступна только администраторам ЭТОГО чата
+    try:
+        caller = await bot.get_chat_member(message.chat.id, message.from_user.id)
+    except Exception:
+        return
+    if caller.status not in ("administrator", "creator"):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await send_and_autodelete(
+            bot, message.chat.id,
+            "⛔️ Команда /checkplayers доступна только администраторам чата.",
+        )
+        return
+
+    status_msg = await message.answer("🔄 Перепроверяю состав чата...")
+
+    known_ids = await get_all_known_player_ids()
+    linked_ids = await get_linked_player_ids(message.chat.id)
+
+    added = 0
+    removed = 0
+
+    for tg_id in known_ids:
+        try:
+            member = await bot.get_chat_member(message.chat.id, tg_id)
+        except Exception:
+            continue
+
+        is_member = member.status in ("member", "administrator", "creator")
+        is_linked = tg_id in linked_ids
+
+        if is_member and not is_linked:
+            await add_player_chat(tg_id, message.chat.id)
+            added += 1
+            await recompute_player_team(bot, tg_id)
+        elif not is_member and is_linked:
+            await remove_player_chat(tg_id, message.chat.id)
+            removed += 1
+            await recompute_player_team(bot, tg_id)
+
+        await asyncio.sleep(0.05)  # не спамим Telegram API
+
+    await status_msg.edit_text(
+        "✅ <b>Проверка состава завершена.</b>\n\n"
+        f"➕ Добавлено в состав: {added}\n"
+        f"➖ Удалено из состава: {removed}\n\n"
+        "ℹ️ Проверены только игроки, которые хотя бы раз писали боту в личные сообщения — "
+        "Telegram Bot API не позволяет получить полный список участников чата напрямую."
+    )
+
+
 @team_chat_router.message()
 async def team_chat_gate(message: Message, bot: Bot):
     chat = await get_chat(message.chat.id)
@@ -1687,6 +1759,34 @@ async def scheduler_loop(bot: Bot):
 
 
 # =========================================================
+#         ПРОВЕРКА ПРАВ АДМИНИСТРАТОРА БОТА В ЧАТАХ
+# =========================================================
+
+async def check_bot_admin_rights(bot: Bot):
+    chats = await get_chats()
+    for chat in chats:
+        try:
+            member = await bot.get_chat_member(chat["chat_id"], bot.id)
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось проверить права бота в чате {chat['chat_id']}: {e}")
+            continue
+        if member.status not in ("administrator", "creator"):
+            await _send_safe(
+                bot, chat["chat_id"],
+                "⚠️ У меня нет прав администратора в этом чате, выдайте их, пожалуйста.",
+            )
+
+
+async def admin_rights_check_loop(bot: Bot):
+    while True:
+        try:
+            await check_bot_admin_rights(bot)
+        except Exception as e:
+            logging.warning(f"⚠️ Ошибка при проверке прав администратора: {e}")
+        await asyncio.sleep(ADMIN_RIGHTS_CHECK_INTERVAL)
+
+
+# =========================================================
 #                          MAIN
 # =========================================================
 
@@ -1726,6 +1826,8 @@ async def main():
     logging.info("✅ База данных подключена и готова")
     asyncio.create_task(scheduler_loop(bot))
     logging.info("✅ Планировщик напоминаний запущен (часовой пояс МСК)")
+    asyncio.create_task(admin_rights_check_loop(bot))
+    logging.info("✅ Проверка прав администратора бота запущена")
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("🚀 Бот запущен, начинаю polling...")
     await dp.start_polling(bot)
