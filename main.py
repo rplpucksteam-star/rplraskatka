@@ -355,6 +355,11 @@ async def get_player_by_username(username: str):
         return await conn.fetchrow("SELECT * FROM players WHERE lower(username) = lower($1)", username)
 
 
+async def get_player_by_steam_id(steam_id: str):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM players WHERE steam_id = $1", steam_id)
+
+
 async def set_player_steam(tg_id: int, steam_id: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = $1 WHERE tg_id = $2", steam_id, tg_id)
@@ -663,11 +668,31 @@ def bans_list_kb(bans) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def profile_menu_kb() -> InlineKeyboardMarkup:
+def profile_menu_kb(player=None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔗 Привязать SteamID", callback_data="profile:steamid")
+    # SteamID можно привязать только один раз — если он уже указан, кнопка не показывается
+    if not (player and player["steam_id"]):
+        kb.button(text="🔗 Привязать SteamID", callback_data="profile:steamid")
     kb.button(text="✏️ Указать никнейм", callback_data="profile:nickname")
     kb.button(text="📋 Составы команд", callback_data="profile:teams")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def teams_list_kb(chats) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for c in chats:
+        logo = f"{c['logo_emoji']} " if c["logo_emoji"] else ""
+        kb.button(text=f"{logo}{c['name']}", callback_data=f"team_view:{c['chat_id']}")
+    kb.button(text="⬅️ Назад", callback_data="profile:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def team_roster_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ К списку команд", callback_data="profile:teams")
+    kb.button(text="🏠 В профиль", callback_data="profile:menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1438,24 +1463,61 @@ async def dm_start(message: Message):
     await upsert_player_basic(tg_id, message.from_user.username, message.from_user.full_name)
     player = await get_player(tg_id)
     text = await build_profile_text(player)
-    await message.answer(text, reply_markup=profile_menu_kb())
+    await message.answer(text, reply_markup=profile_menu_kb(player))
+
+
+@dm_router.callback_query(F.data == "profile:menu")
+async def cb_profile_menu(call: CallbackQuery):
+    tg_id = call.from_user.id
+    player = await get_player(tg_id)
+    if not player:
+        await upsert_player_basic(tg_id, call.from_user.username, call.from_user.full_name)
+        player = await get_player(tg_id)
+    text = await build_profile_text(player)
+    await call.message.edit_text(text, reply_markup=profile_menu_kb(player))
+    await call.answer()
 
 
 @dm_router.callback_query(F.data == "profile:steamid")
 async def cb_prompt_steamid(call: CallbackQuery, state: FSMContext):
+    player = await get_player(call.from_user.id)
+    if player and player["steam_id"]:
+        await call.answer("SteamID уже привязан и изменить его нельзя.", show_alert=True)
+        return
     await state.set_state(SetProfile.waiting_steamid)
-    await call.message.answer("🎮 Пришлите ваш SteamID (например, 76561198000000000 или ссылку на профиль Steam):")
+    await call.message.answer(
+        "🎮 Пришлите ваш SteamID (например, 76561198000000000 или ссылку на профиль Steam).\n\n"
+        "⚠️ Привязать SteamID можно только один раз — изменить его потом будет нельзя, "
+        "так что проверьте, что указываете правильный."
+    )
     await call.answer()
 
 
 @dm_router.message(SetProfile.waiting_steamid)
 async def process_set_steamid(message: Message, state: FSMContext):
+    tg_id = message.from_user.id
+    player = await get_player(tg_id)
+
+    if player and player["steam_id"]:
+        await state.clear()
+        await message.answer(
+            "❌ SteamID уже привязан, изменить его нельзя.",
+            reply_markup=profile_menu_kb(player),
+        )
+        return
+
     steam_id = message.text.strip()
-    await set_player_steam(message.from_user.id, steam_id)
+
+    existing = await get_player_by_steam_id(steam_id)
+    if existing and existing["tg_id"] != tg_id:
+        await message.answer("❌ Этот SteamID уже привязан другим игроком. Пришлите другой SteamID:")
+        return
+
+    await set_player_steam(tg_id, steam_id)
     await state.clear()
-    player = await get_player(message.from_user.id)
+    player = await get_player(tg_id)
     text = await build_profile_text(player)
-    await message.answer("✅ SteamID сохранён!\n\n" + text, reply_markup=profile_menu_kb())
+    await message.answer("✅ SteamID привязан!\n\n" + text, reply_markup=profile_menu_kb(player))
 
 
 @dm_router.callback_query(F.data == "profile:nickname")
@@ -1472,39 +1534,53 @@ async def process_set_nickname(message: Message, state: FSMContext):
     await state.clear()
     player = await get_player(message.from_user.id)
     text = await build_profile_text(player)
-    await message.answer("✅ Никнейм сохранён!\n\n" + text, reply_markup=profile_menu_kb())
+    await message.answer("✅ Никнейм сохранён!\n\n" + text, reply_markup=profile_menu_kb(player))
 
 
-async def send_all_rosters(message: Message):
-    chats = await get_chats()
-    if not chats:
-        await message.answer("Команд пока нет.")
-        return
-    for chat in chats:
-        roster = await get_team_roster(chat["chat_id"])
-        logo = f"{chat['logo_emoji']} " if chat["logo_emoji"] else ""
-        if roster:
-            lines = []
-            for p in roster:
-                name = esc(p["nickname"]) if p["nickname"] else esc(p["first_name"] or "Без имени")
-                steam = esc(p["steam_id"]) if p["steam_id"] else "—"
-                lines.append(f"• {name} (<code>{steam}</code>)")
-            body = "\n".join(lines)
-        else:
-            body = "Пусто"
-        text = f"{logo}<b>{esc(chat['name'])}</b>\n\n{body}"
-        await message.answer(text)
+async def build_roster_text(chat) -> str:
+    roster = await get_team_roster(chat["chat_id"])
+    logo = f"{chat['logo_emoji']} " if chat["logo_emoji"] else ""
+    if roster:
+        lines = []
+        for p in roster:
+            name = esc(p["nickname"]) if p["nickname"] else esc(p["first_name"] or "Без имени")
+            steam = esc(p["steam_id"]) if p["steam_id"] else "—"
+            lines.append(f"• {name} (<code>{steam}</code>)")
+        body = "\n".join(lines)
+    else:
+        body = "Пусто"
+    return f"{logo}<b>{esc(chat['name'])}</b>\n\n{body}"
 
 
 @dm_router.callback_query(F.data == "profile:teams")
 async def cb_show_teams(call: CallbackQuery):
+    chats = await get_chats()
+    if not chats:
+        await call.answer("Команд пока нет.", show_alert=True)
+        return
+    await call.message.edit_text("🏒 <b>Выберите команду:</b>", reply_markup=teams_list_kb(chats))
     await call.answer()
-    await send_all_rosters(call.message)
+
+
+@dm_router.callback_query(F.data.startswith("team_view:"))
+async def cb_view_team(call: CallbackQuery):
+    chat_id = int(call.data.split(":")[1])
+    chat = await get_chat(chat_id)
+    if not chat:
+        await call.answer("Команда не найдена.", show_alert=True)
+        return
+    text = await build_roster_text(chat)
+    await call.message.edit_text(text, reply_markup=team_roster_kb())
+    await call.answer()
 
 
 @dm_router.message(Command("teams"))
 async def cmd_teams(message: Message):
-    await send_all_rosters(message)
+    chats = await get_chats()
+    if not chats:
+        await message.answer("Команд пока нет.")
+        return
+    await message.answer("🏒 <b>Выберите команду:</b>", reply_markup=teams_list_kb(chats))
 
 
 @dm_router.callback_query(F.data.startswith("chooseteam:"))
