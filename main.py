@@ -140,6 +140,12 @@ async def init_pool():
                 until TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS exceptions (
+                id SERIAL PRIMARY KEY,
+                tg_id BIGINT UNIQUE NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             """
         )
 
@@ -338,7 +344,8 @@ async def upsert_player_basic(tg_id: int, username: str | None, first_name: str 
             """
             INSERT INTO players (tg_id, username, first_name)
             VALUES ($1, $2, $3)
-            ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
+            ON CONFLICT (tg_id) DO UPDATE SET username = COALESCE(EXCLUDED.username, players.username),
+                                              first_name = COALESCE(EXCLUDED.first_name, players.first_name)
             """,
             tg_id, username, first_name,
         )
@@ -456,6 +463,39 @@ async def get_active_bans():
         )
 
 
+# ---------- Исключения ----------
+
+async def add_exception_db(tg_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO exceptions (tg_id) VALUES ($1) ON CONFLICT (tg_id) DO NOTHING",
+            tg_id,
+        )
+
+
+async def remove_exception_db(tg_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM exceptions WHERE tg_id = $1", tg_id)
+
+
+async def is_exception(tg_id: int) -> bool:
+    async with _pool.acquire() as conn:
+        val = await conn.fetchval("SELECT 1 FROM exceptions WHERE tg_id = $1", tg_id)
+        return bool(val)
+
+
+async def get_exceptions():
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT e.tg_id, e.created_at, p.username, p.first_name, p.nickname
+            FROM exceptions e
+            LEFT JOIN players p ON p.tg_id = e.tg_id
+            ORDER BY e.id DESC
+            """
+        )
+
+
 # =========================================================
 #                    ТЕКСТЫ СООБЩЕНИЙ
 # =========================================================
@@ -551,6 +591,16 @@ class BanPlayer(StatesGroup):
     waiting_duration = State()
 
 
+class AdminExceptions(StatesGroup):
+    waiting_target = State()
+
+
+class AdminEditProfile(StatesGroup):
+    waiting_target = State()
+    waiting_nickname = State()
+    waiting_steamid = State()
+
+
 # ---------- FSM для игроков (в ЛС бота) ----------
 
 class SetProfile(StatesGroup):
@@ -573,6 +623,8 @@ def admin_main_menu() -> InlineKeyboardMarkup:
     kb.button(text="🗄 Список серверов", callback_data="adm:list_servers")
     kb.button(text="📡 Привязать канал", callback_data="adm:add_channel")
     kb.button(text="🔗 Список каналов", callback_data="adm:list_channels")
+    kb.button(text="🛡 Исключения", callback_data="adm:exceptions_menu")
+    kb.button(text="👤 Ред. профиля", callback_data="adm:edit_profile")
     kb.button(text="🚫 Забанить игрока", callback_data="adm:ban_player")
     kb.button(text="📋 Баны", callback_data="adm:list_bans")
     kb.adjust(2)
@@ -582,6 +634,45 @@ def admin_main_menu() -> InlineKeyboardMarkup:
 def back_to_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    return kb.as_markup()
+
+
+def exceptions_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить исключение", callback_data="adm:add_exception")
+    kb.button(text="📋 Список исключений", callback_data="adm:list_exceptions")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def exceptions_list_kb(exceptions) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for ex in exceptions:
+        label = f"❌ Удалить {ex['tg_id']}"
+        kb.button(text=label, callback_data=f"adm:del_exception:{ex['tg_id']}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_player_card_kb(tg_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Изменить Никнейм", callback_data=f"adm_pedit:nick:{tg_id}")
+    kb.button(text="🎮 Изменить SteamID", callback_data=f"adm_pedit:steam:{tg_id}")
+    kb.button(text="🏒 Изменить Команду", callback_data=f"adm_pedit:team:{tg_id}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_teams_choice_kb(chats, tg_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🆓 Free Agent (Без команды)", callback_data=f"adm_pedit_setteam:{tg_id}:0")
+    for c in chats:
+        kb.button(text=f"🏒 {c['name']}", callback_data=f"adm_pedit_setteam:{tg_id}:{c['chat_id']}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -805,6 +896,222 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+# ---------- ИСКЛЮЧЕНИЯ (МУЛЬТИЧАТ) ----------
+@panel_router.callback_query(F.data == "adm:exceptions_menu")
+async def cb_exceptions_menu(call: CallbackQuery):
+    await call.message.edit_text("🛡 <b>Управление исключениями (мультичат)</b>", reply_markup=exceptions_menu_kb())
+    await call.answer()
+
+
+@panel_router.callback_query(F.data == "adm:add_exception")
+async def cb_add_exception_prompt(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminExceptions.waiting_target)
+    await call.message.edit_text(
+        "➕ <b>Добавление исключения</b>\n\n"
+        "Пришлите TG ID или @username игрока, которому разрешено находиться сразу в нескольких чатах команд:",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
+@panel_router.message(AdminExceptions.waiting_target)
+async def process_add_exception(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    target_id = None
+    if raw.startswith("@"):
+        player = await get_player_by_username(raw[1:])
+        if player:
+            target_id = player["tg_id"]
+    else:
+        try:
+            target_id = int(raw)
+        except ValueError:
+            target_id = None
+
+    if not target_id:
+        await message.answer("❌ Игрок не найден. Отправьте числовой TG ID или корректный @username игрока:")
+        return
+
+    await add_exception_db(target_id)
+    await state.clear()
+    await message.answer(
+        f"✅ Игрок <code>{target_id}</code> успешно добавлен в исключения! Теперь ему можно состоять в нескольких чатах.",
+        reply_markup=admin_main_menu(),
+    )
+
+
+@panel_router.callback_query(F.data == "adm:list_exceptions")
+async def cb_list_exceptions(call: CallbackQuery):
+    ex_list = await get_exceptions()
+    if not ex_list:
+        await call.message.edit_text("📋 Список исключений пуст.", reply_markup=exceptions_menu_kb())
+        await call.answer()
+        return
+
+    lines = []
+    for ex in ex_list:
+        username = f"@{esc(ex['username'])}" if ex["username"] else "—"
+        nickname = esc(ex["nickname"]) if ex["nickname"] else esc(ex["first_name"] or "Игрок")
+        lines.append(f"🛡 <b>{nickname}</b> (<code>{ex['tg_id']}</code> | {username})")
+
+    await call.message.edit_text(
+        "📋 <b>Игроки в исключениях (мультичат):</b>\n\n" + "\n".join(lines),
+        reply_markup=exceptions_list_kb(ex_list),
+    )
+    await call.answer()
+
+
+@panel_router.callback_query(F.data.startswith("adm:del_exception:"))
+async def cb_delete_exception(call: CallbackQuery):
+    tg_id = int(call.data.split(":")[2])
+    await remove_exception_db(tg_id)
+    await call.answer("🗑 Исключение удалено", show_alert=True)
+    ex_list = await get_exceptions()
+    if not ex_list:
+        await call.message.edit_text("📋 Список исключений пуст.", reply_markup=exceptions_menu_kb())
+        return
+    await call.message.edit_text("📋 <b>Игроки в исключениях:</b>", reply_markup=exceptions_list_kb(ex_list))
+
+
+# ---------- РЕДАКТОР ПРОФИЛЯ ИГРОКА (АДМИН) ----------
+async def show_admin_player_card(message_or_call, tg_id: int):
+    player = await get_player(tg_id)
+    if not player:
+        await upsert_player_basic(tg_id, None, "Игрок")
+        player = await get_player(tg_id)
+
+    profile_text = await build_profile_text(player)
+    text = f"👤 <b>Редактирование профиля игрока</b>\n\n{profile_text}"
+
+    if isinstance(message_or_call, Message):
+        await message_or_call.answer(text, reply_markup=admin_player_card_kb(tg_id))
+    else:
+        await message_or_call.message.edit_text(text, reply_markup=admin_player_card_kb(tg_id))
+
+
+@panel_router.callback_query(F.data == "adm:edit_profile")
+async def cb_edit_profile_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminEditProfile.waiting_target)
+    await call.message.edit_text(
+        "👤 <b>Редактор профиля</b>\n\nПришлите TG ID или @username игрока, чей профиль вы хотите изменить:",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
+@panel_router.message(AdminEditProfile.waiting_target)
+async def process_edit_profile_target(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    target_id = None
+    if raw.startswith("@"):
+        player = await get_player_by_username(raw[1:])
+        if player:
+            target_id = player["tg_id"]
+    else:
+        try:
+            target_id = int(raw)
+        except ValueError:
+            target_id = None
+
+    if not target_id:
+        await message.answer("❌ Игрок не найден. Пришлите числовой TG ID или корректный @username:")
+        return
+
+    await state.clear()
+    await show_admin_player_card(message, target_id)
+
+
+@panel_router.callback_query(F.data.startswith("adm_pedit:nick:"))
+async def cb_edit_p_nick_prompt(call: CallbackQuery, state: FSMContext):
+    tg_id = int(call.data.split(":")[2])
+    await state.update_data(pedit_target=tg_id)
+    await state.set_state(AdminEditProfile.waiting_nickname)
+    await call.message.edit_text(
+        f"✏️ <b>Изменение Никнейма (TG ID: <code>{tg_id}</code>)</b>\n\n"
+        "Пришлите новый никнейм и номер (рекомендуется формат: <code>Nick #Number</code>):",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
+@panel_router.message(AdminEditProfile.waiting_nickname)
+async def process_admin_set_nickname(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    tg_id = data.get("pedit_target")
+    if not tg_id:
+        await state.clear()
+        await message.answer("❌ Ошибка определения игрока.", reply_markup=admin_main_menu())
+        return
+
+    new_nick = message.text.strip()
+    await set_player_nickname(tg_id, new_nick)
+    await state.clear()
+    await sync_player_chats_and_team(bot, tg_id)
+    await message.answer("✅ Никнейм игрока обновлён!")
+    await show_admin_player_card(message, tg_id)
+
+
+@panel_router.callback_query(F.data.startswith("adm_pedit:steam:"))
+async def cb_edit_p_steam_prompt(call: CallbackQuery, state: FSMContext):
+    tg_id = int(call.data.split(":")[2])
+    await state.update_data(pedit_target=tg_id)
+    await state.set_state(AdminEditProfile.waiting_steamid)
+    await call.message.edit_text(
+        f"🎮 <b>Изменение SteamID (TG ID: <code>{tg_id}</code>)</b>\n\n"
+        "Пришлите новый SteamID для этого игрока:",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
+@panel_router.message(AdminEditProfile.waiting_steamid)
+async def process_admin_set_steamid(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    tg_id = data.get("pedit_target")
+    if not tg_id:
+        await state.clear()
+        await message.answer("❌ Ошибка определения игрока.", reply_markup=admin_main_menu())
+        return
+
+    new_steam = message.text.strip()
+    await set_player_steam(tg_id, new_steam)
+    await state.clear()
+    await sync_player_chats_and_team(bot, tg_id)
+    await message.answer("✅ SteamID игрока обновлён!")
+    await show_admin_player_card(message, tg_id)
+
+
+@panel_router.callback_query(F.data.startswith("adm_pedit:team:"))
+async def cb_edit_p_team_prompt(call: CallbackQuery):
+    tg_id = int(call.data.split(":")[2])
+    chats = await get_chats()
+    await call.message.edit_text(
+        f"🏒 <b>Изменение команды игрока (TG ID: <code>{tg_id}</code>)</b>\n\n"
+        "Выберите новую команду для игрока:",
+        reply_markup=admin_teams_choice_kb(chats, tg_id),
+    )
+    await call.answer()
+
+
+@panel_router.callback_query(F.data.startswith("adm_pedit_setteam:"))
+async def cb_edit_p_set_team(call: CallbackQuery):
+    parts = call.data.split(":")
+    tg_id = int(parts[1])
+    chat_id = int(parts[2])
+
+    if chat_id == 0:
+        await set_player_team(tg_id, None)
+        await call.answer("Игрок переведён в статус Free Agent", show_alert=True)
+    else:
+        await set_player_team(tg_id, chat_id)
+        await add_player_chat(tg_id, chat_id)
+        chat = await get_chat(chat_id)
+        tname = chat['name'] if chat else "команда"
+        await call.answer(f"Игрок переведён в команду {tname}", show_alert=True)
+
+    await show_admin_player_card(call, tg_id)
+
+
 # ---------- Добавление чата ----------
 @panel_router.callback_query(F.data == "adm:add_chat")
 async def cb_add_chat(call: CallbackQuery, state: FSMContext):
@@ -913,9 +1220,7 @@ async def cb_edit_chat_emoji_prompt(call: CallbackQuery, state: FSMContext):
 async def process_edit_chat_emoji(message: Message, state: FSMContext, bot: Bot):
     entity = next((e for e in (message.entities or []) if e.type == "custom_emoji"), None)
     if not entity or not message.text:
-        await message.answer(
-            "❌ Не найден premium-эмодзи. Отправьте сообщение, содержащее custom emoji."
-        )
+        await message.answer("❌ Не найден premium-эмодзи. Отправьте сообщение, содержащее custom emoji.")
         return
 
     emoji_char = message.text[entity.offset: entity.offset + entity.length]
@@ -1510,7 +1815,7 @@ async def process_set_nickname(message: Message, state: FSMContext, bot: Bot):
     # Автоматическая синхронизация состава
     await sync_player_chats_and_team(bot, tg_id)
 
-    player = await get_player(tg_id)
+    player = await get_player(message.from_user.id)
     text = await build_profile_text(player)
     await message.answer("✅ <b>Никнейм и номер сохранены!</b>\n\n" + text, reply_markup=profile_menu_kb(player))
 
@@ -1565,6 +1870,16 @@ async def cmd_teams(message: Message):
 async def cb_choose_team(call: CallbackQuery, bot: Bot):
     chosen_chat_id = int(call.data.split(":")[1])
     tg_id = call.from_user.id
+
+    # Вдруг игрок в исключениях?
+    if await is_exception(tg_id):
+        await set_player_team(tg_id, chosen_chat_id)
+        chat_info = await get_chat(chosen_chat_id)
+        name = chat_info["name"] if chat_info else "команда"
+        await call.message.edit_text(f"✅ Вы выбрали основную команду: <b>{esc(name)}</b>")
+        await call.answer()
+        return
+
     chat_ids = await get_player_chat_ids(tg_id)
 
     if chosen_chat_id not in chat_ids:
@@ -1684,21 +1999,26 @@ async def team_chat_gate(message: Message, bot: Bot):
         )
         return
 
-    # 3. Нахождение сразу в нескольких командах
-    chat_ids = await get_player_chat_ids(tg_id)
-    if len(chat_ids) >= 2:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        await send_and_autodelete(
-            bot, message.chat.id,
-            f"⚠️ {full_name}, вы состоите в чатах двух команд сразу! Выберите основную команду в ЛС бота.",
-        )
-        return
+    # 3. Нахождение сразу в нескольких командах (если игрок не в списке исключений)
+    if not await is_exception(tg_id):
+        chat_ids = await get_player_chat_ids(tg_id)
+        if len(chat_ids) >= 2:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await send_and_autodelete(
+                bot, message.chat.id,
+                f"⚠️ {full_name}, вы состоите в чатах двух команд сразу! Выберите основную команду в ЛС бота.",
+            )
+            return
 
 
 async def recompute_player_team(bot: Bot, tg_id: int):
+    # Если игрок находится в списке исключений, ему разрешено быть в нескольких чатах
+    if await is_exception(tg_id):
+        return
+
     chat_ids = await get_player_chat_ids(tg_id)
 
     if len(chat_ids) <= 1:
@@ -1809,7 +2129,7 @@ async def send_daily_steam_report(bot: Bot):
             else:
                 unlinked_players.append(f"• {name}")
 
-        text = "📊 <b>Ежедневный отчёт по привязке SteamID</b>\n━━━━━━━━━━━━━━━━━━━\.n\n"
+        text = "📊 <b>Ежедневный отчёт по привязке SteamID</b>\n━━━━━━━━━━━━━━━━━━━\n\n"
 
         text += "✅ <b>Игроки кто привязал steamid:</b>\n"
         text += "\n".join(linked_players) if linked_players else "<i>Никто не привязал</i>"
@@ -1949,7 +2269,7 @@ async def main():
         return True
 
     await init_pool()
-    logging.info("✅ База данных подключена и готово к работе")
+    logging.info("✅ База данных подключена и готова к работе")
 
     # Фоновые сервисы
     asyncio.create_task(scheduler_loop(bot))
